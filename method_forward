@@ -70,11 +70,18 @@ class DynamicDAG(nn.Module):
     # of represented data.
     # =========================================================
 
-    def encode_context(self, z):
+   def encode_context(self, z):
+    x = self.projector(z)
 
-        x = self.projector(z)
+    # Fix the scale non-identifiability between x and alpha.
+    x = x / torch.linalg.vector_norm(
+        x,
+        ord=2,
+        dim=-1,
+        keepdim=True
+    ).clamp_min(1e-8)
 
-        return x
+    return x
 
     # =========================================================
     # To compute beta.
