@@ -1,739 +1,364 @@
 # evaluate.py
+from __future__ import annotations
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 
 
-# ============================================================
-# Basic utilities
-# ============================================================
+def _as_cpu_int_adjacency(adjacency: torch.Tensor) -> np.ndarray:
+    A = adjacency.detach().cpu().numpy()
+    if A.ndim != 2 or A.shape[0] != A.shape[1]:
+        raise ValueError("adjacency must be a square 2D matrix.")
+    return (A != 0).astype(np.int64)
 
-def get_model_device(model):
+
+def is_dag(adjacency: torch.Tensor) -> bool:
     """
-    Return the device on which model parameters are stored.
+    Exact DAG check using Kahn's topological-sort algorithm.
+
+    Convention: adjacency[i, j] = 1 means i -> j.
     """
-    return next(model.parameters()).device
-
-
-def move_optional_tensor(
-    tensor: Optional[torch.Tensor],
-    device: torch.device
-):
-    """
-    Move tensor to device if it is not None.
-    """
-    if tensor is None:
-        return None
-
-    return tensor.to(device)
-
-
-def prepare_observational_mask(
-    Y: torch.Tensor,
-    observational_mask: Optional[torch.Tensor]
-):
-    """
-    Construct a float mask with the same shape as Y.
-
-    mask[k, j] = 1:
-        sample k is observational for node j.
-
-    mask[k, j] = 0:
-        node j is intervened for sample k.
-
-    If observational_mask is None, all entries are treated
-    as observational.
-    """
-
-    if observational_mask is None:
-
-        mask = torch.ones_like(
-            Y,
-            dtype=Y.dtype
-        )
-
-    else:
-
-        if observational_mask.shape != Y.shape:
-            raise ValueError(
-                "observational_mask must have the same shape as Y. "
-                f"Got mask={observational_mask.shape}, Y={Y.shape}."
-            )
-
-        mask = observational_mask.to(
-            device=Y.device,
-            dtype=Y.dtype
-        )
-
-    return mask
-
-
-# ============================================================
-# Overall masked regression metrics
-# ============================================================
-
-def masked_regression_metrics(
-    Y_true: torch.Tensor,
-    Y_pred: torch.Tensor,
-    observational_mask: Optional[torch.Tensor] = None,
-    eps: float = 1e-12
-) -> Dict[str, float]:
-    """
-    Compute regression metrics using only observational entries.
-
-    Returns
-    -------
-    mse
-    rmse
-    mae
-    r2
-    n_observed
-    """
-
-    if Y_true.shape != Y_pred.shape:
-        raise ValueError(
-            "Y_true and Y_pred must have the same shape. "
-            f"Got {Y_true.shape} and {Y_pred.shape}."
-        )
-
-    mask = prepare_observational_mask(
-        Y_true,
-        observational_mask
-    )
-
-    n_observed = mask.sum()
-
-    if n_observed.item() <= 0:
-        raise ValueError(
-            "No observational entries are available for evaluation."
-        )
-
-    residual = Y_true - Y_pred
-
-    # --------------------------------------------------------
-    # MSE
-    # --------------------------------------------------------
-
-    squared_error = residual.pow(2)
-
-    mse = (
-        squared_error * mask
-    ).sum() / n_observed
-
-    # --------------------------------------------------------
-    # RMSE
-    # --------------------------------------------------------
-
-    rmse = torch.sqrt(
-        mse.clamp_min(0.0)
-    )
-
-    # --------------------------------------------------------
-    # MAE
-    # --------------------------------------------------------
-
-    mae = (
-        residual.abs() * mask
-    ).sum() / n_observed
-
-    # --------------------------------------------------------
-    # Global masked R^2
-    # --------------------------------------------------------
-
-    target_mean = (
-        Y_true * mask
-    ).sum() / n_observed
-
-    ss_res = (
-        squared_error * mask
-    ).sum()
-
-    ss_tot = (
-        ((Y_true - target_mean) ** 2)
-        * mask
-    ).sum()
-
-    if ss_tot.item() <= eps:
-        r2 = torch.tensor(
-            float("nan"),
-            device=Y_true.device
-        )
-    else:
-        r2 = 1.0 - ss_res / ss_tot
-
-    return {
-        "mse": float(mse.detach().cpu()),
-        "rmse": float(rmse.detach().cpu()),
-        "mae": float(mae.detach().cpu()),
-        "r2": float(r2.detach().cpu()),
-        "n_observed": int(
-            n_observed.detach().cpu().item()
-        )
-    }
-
-
-# ============================================================
-# Nodewise evaluation
-# ============================================================
-
-def nodewise_regression_metrics(
-    Y_true: torch.Tensor,
-    Y_pred: torch.Tensor,
-    observational_mask: Optional[torch.Tensor] = None,
-    eps: float = 1e-12
-) -> Dict[int, Dict[str, float]]:
-    """
-    Compute MSE / RMSE / MAE / R^2 separately for every node.
-
-    Only observational samples for each node are used.
-
-    Returns
-    -------
-    {
-        0: {
-            "mse": ...,
-            "rmse": ...,
-            "mae": ...,
-            "r2": ...,
-            "n_observed": ...
-        },
-        1: {...},
-        ...
-    }
-    """
-
-    mask = prepare_observational_mask(
-        Y_true,
-        observational_mask
-    )
-
-    p = Y_true.shape[1]
-
-    results = {}
-
-    for j in range(p):
-
-        node_mask = mask[:, j] > 0
-
-        n_j = int(
-            node_mask.sum().item()
-        )
-
-        if n_j == 0:
-
-            results[j] = {
-                "mse": float("nan"),
-                "rmse": float("nan"),
-                "mae": float("nan"),
-                "r2": float("nan"),
-                "n_observed": 0
-            }
-
-            continue
-
-        y_j = Y_true[node_mask, j]
-        y_hat_j = Y_pred[node_mask, j]
-
-        residual = y_j - y_hat_j
-
-        mse = residual.pow(2).mean()
-        rmse = torch.sqrt(
-            mse.clamp_min(0.0)
-        )
-        mae = residual.abs().mean()
-
-        target_mean = y_j.mean()
-
-        ss_res = residual.pow(2).sum()
-
-        ss_tot = (
-            (y_j - target_mean) ** 2
-        ).sum()
-
-        if ss_tot.item() <= eps:
-
-            r2 = torch.tensor(
-                float("nan"),
-                device=Y_true.device
-            )
-
-        else:
-
-            r2 = (
-                1.0
-                - ss_res / ss_tot
-            )
-
-        results[j] = {
-            "mse": float(
-                mse.detach().cpu()
-            ),
-            "rmse": float(
-                rmse.detach().cpu()
-            ),
-            "mae": float(
-                mae.detach().cpu()
-            ),
-            "r2": float(
-                r2.detach().cpu()
-            ),
-            "n_observed": n_j
-        }
-
-    return results
-
-
-# ============================================================
-# Graph extraction
-# ============================================================
-
-def extract_adjacency(
-    model,
-    threshold: float = 1e-3
-):
-    """
-    Convert the continuous global support matrix
-
-        S_ij = ||alpha_ij||_2
-
-    into a binary adjacency matrix.
-
-    Convention
-    ----------
-    adjacency[i, j] = 1
-        means i -> j.
-
-    Parameters
-    ----------
-    threshold:
-        Edge i -> j is selected when S_ij > threshold.
-    """
-
-    if threshold < 0:
-        raise ValueError(
-            "threshold must be non-negative."
-        )
-
-    model.eval()
-
-    with torch.inference_mode():
-
-        S = model.support_matrix()
-
-        adjacency = (
-            S > threshold
-        ).to(torch.int64)
-
-        adjacency.fill_diagonal_(0)
-
-    return (
-        S.detach().cpu(),
-        adjacency.detach().cpu()
-    )
-
-
-# ============================================================
-# Exact DAG test
-# ============================================================
-
-def is_dag(
-    adjacency: torch.Tensor
-) -> bool:
-    """
-    Check whether a binary directed adjacency matrix is a DAG
-    using Kahn's topological-sort algorithm.
-
-    adjacency[i, j] = 1 means i -> j.
-    """
-
-    A = (
-        adjacency
-        .detach()
-        .cpu()
-        .numpy()
-    )
-
-    if A.ndim != 2:
-        raise ValueError(
-            "adjacency must be a 2D matrix."
-        )
-
-    p1, p2 = A.shape
-
-    if p1 != p2:
-        raise ValueError(
-            "adjacency must be square."
-        )
-
-    p = p1
-
-    # --------------------------------------------------------
-    # indegree[j]
-    # --------------------------------------------------------
-
-    indegree = (
-        A.sum(axis=0)
-        .astype(np.int64)
-    )
-
-    # Nodes with no parents
-    queue = [
-        j
-        for j in range(p)
-        if indegree[j] == 0
-    ]
-
+    A = _as_cpu_int_adjacency(adjacency)
+    p = A.shape[0]
+
+    indegree = A.sum(axis=0).astype(np.int64)
+    stack = [j for j in range(p) if indegree[j] == 0]
     visited = 0
 
-    while queue:
-
-        node = queue.pop()
-
+    while stack:
+        node = stack.pop()
         visited += 1
-
-        # All children of current node
-        children = np.where(
-            A[node, :] != 0
-        )[0]
+        children = np.where(A[node] != 0)[0]
 
         for child in children:
-
             indegree[child] -= 1
-
             if indegree[child] == 0:
-                queue.append(child)
+                stack.append(int(child))
 
     return visited == p
 
 
-# ============================================================
-# Graph-level summary
-# ============================================================
+def _has_path(A: np.ndarray, source: int, target: int) -> bool:
+    """
+    Return True if the current directed graph has source -> ... -> target.
+    """
+    if source == target:
+        return True
+
+    p = A.shape[0]
+    seen = np.zeros(p, dtype=bool)
+    stack = [source]
+    seen[source] = True
+
+    while stack:
+        node = stack.pop()
+        for nxt in np.where(A[node] != 0)[0]:
+            nxt = int(nxt)
+            if nxt == target:
+                return True
+            if not seen[nxt]:
+                seen[nxt] = True
+                stack.append(nxt)
+
+    return False
+
+
+def extract_raw_adjacency(
+    support: torch.Tensor,
+    threshold: float,
+) -> torch.Tensor:
+    """
+    Plain thresholding. This may be cyclic and is useful for diagnostics.
+    """
+    if threshold < 0:
+        raise ValueError("threshold must be nonnegative.")
+
+    adjacency = (support.detach().cpu() > threshold).to(torch.int64)
+    adjacency.fill_diagonal_(0)
+    return adjacency
+
+
+def extract_dag_adjacency(
+    support: torch.Tensor,
+    threshold: float,
+) -> torch.Tensor:
+    """
+    Cycle-safe graph extraction inspired by SDCD.
+
+    Candidate edges are considered from strongest to weakest. An edge i -> j
+    is added only if its weight exceeds threshold and adding it would not
+    create a path j -> ... -> i, i.e. a directed cycle.
+    """
+    if threshold < 0:
+        raise ValueError("threshold must be nonnegative.")
+
+    S = support.detach().cpu().numpy()
+    p = S.shape[0]
+    if S.ndim != 2 or S.shape[1] != p:
+        raise ValueError("support must be square.")
+
+    candidates = [
+        (float(S[i, j]), i, j)
+        for i in range(p)
+        for j in range(p)
+        if i != j and S[i, j] > threshold
+    ]
+    candidates.sort(reverse=True, key=lambda t: t[0])
+
+    A = np.zeros((p, p), dtype=np.int64)
+
+    for weight, i, j in candidates:
+        # i -> j creates a cycle iff j already reaches i.
+        if _has_path(A, j, i):
+            continue
+        A[i, j] = 1
+
+    return torch.from_numpy(A)
+
 
 def graph_summary(
     support: torch.Tensor,
-    adjacency: torch.Tensor
+    threshold: float,
 ) -> Dict[str, Any]:
-    """
-    Summarize the learned global graph.
-    """
+    raw_adj = extract_raw_adjacency(support, threshold)
+    dag_adj = extract_dag_adjacency(support, threshold)
 
-    p = adjacency.shape[0]
+    p = support.shape[0]
+    max_edges = p * (p - 1)
 
-    n_edges = int(
-        adjacency.sum().item()
-    )
-
-    max_possible_edges = (
-        p * (p - 1)
-    )
-
-    density = (
-        n_edges / max_possible_edges
-        if max_possible_edges > 0
-        else 0.0
-    )
-
-    selected_strengths = support[
-        adjacency.bool()
-    ]
-
-    if selected_strengths.numel() > 0:
-
-        mean_edge_strength = float(
-            selected_strengths
-            .mean()
-            .item()
-        )
-
-        max_edge_strength = float(
-            selected_strengths
-            .max()
-            .item()
-        )
-
-        min_edge_strength = float(
-            selected_strengths
-            .min()
-            .item()
-        )
-
-    else:
-
-        mean_edge_strength = 0.0
-        max_edge_strength = 0.0
-        min_edge_strength = 0.0
+    selected = support.detach().cpu()[dag_adj.bool()]
 
     return {
         "n_nodes": p,
-        "n_edges": n_edges,
-        "density": density,
-
-        "mean_selected_strength":
-            mean_edge_strength,
-
-        "max_selected_strength":
-            max_edge_strength,
-
-        "min_selected_strength":
-            min_edge_strength,
-
-        "is_dag": is_dag(
-            adjacency
-        )
+        "threshold": float(threshold),
+        "raw_n_edges": int(raw_adj.sum().item()),
+        "raw_is_dag": is_dag(raw_adj),
+        "n_edges": int(dag_adj.sum().item()),
+        "density": (
+            float(dag_adj.sum().item()) / max_edges if max_edges > 0 else 0.0
+        ),
+        "is_dag": is_dag(dag_adj),
+        "mean_selected_strength": (
+            float(selected.mean().item()) if selected.numel() else 0.0
+        ),
+        "min_selected_strength": (
+            float(selected.min().item()) if selected.numel() else 0.0
+        ),
+        "max_selected_strength": (
+            float(selected.max().item()) if selected.numel() else 0.0
+        ),
+        "raw_adjacency": raw_adj,
+        "adjacency": dag_adj,
     }
 
 
-# ============================================================
-# Main evaluation function
-# ============================================================
+@torch.no_grad()
+def _evaluate_batches(
+    model,
+    z: torch.Tensor,
+    Y: torch.Tensor,
+    observational_mask: Optional[torch.Tensor],
+    batch_size: int,
+    return_tensors: bool,
+) -> Dict[str, Any]:
+    device = next(model.parameters()).device
 
+    if observational_mask is None:
+        mask = torch.ones_like(Y)
+    else:
+        if observational_mask.shape != Y.shape:
+            raise ValueError(
+                "observational_mask must have same shape as Y; "
+                f"got {observational_mask.shape} vs {Y.shape}."
+            )
+        mask = observational_mask
+
+    dataset = TensorDataset(z, Y, mask)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    p = Y.shape[1]
+
+    total_n = 0.0
+    total_sq = 0.0
+    total_abs = 0.0
+
+    node_n = torch.zeros(p, dtype=torch.float64)
+    node_sq = torch.zeros(p, dtype=torch.float64)
+    node_abs = torch.zeros(p, dtype=torch.float64)
+    node_y_sum = torch.zeros(p, dtype=torch.float64)
+    node_y2_sum = torch.zeros(p, dtype=torch.float64)
+
+    pred_chunks: List[torch.Tensor] = []
+    target_chunks: List[torch.Tensor] = []
+    beta_chunks: List[torch.Tensor] = []
+    context_chunks: List[torch.Tensor] = []
+    mask_chunks: List[torch.Tensor] = []
+
+    model.eval()
+
+    for z_b, Y_b, m_b in loader:
+        z_b = z_b.to(device)
+        Y_b = Y_b.to(device)
+        m_b = m_b.to(device=device, dtype=Y_b.dtype)
+
+        out = model(z_b, Y_b)
+        pred = out["Y_hat"]
+
+        residual = Y_b - pred
+        sq = residual.pow(2)
+        ab = residual.abs()
+
+        total_n += float(m_b.sum().item())
+        total_sq += float((sq * m_b).sum().item())
+        total_abs += float((ab * m_b).sum().item())
+
+        node_n += m_b.sum(dim=0).detach().cpu().double()
+        node_sq += (sq * m_b).sum(dim=0).detach().cpu().double()
+        node_abs += (ab * m_b).sum(dim=0).detach().cpu().double()
+        node_y_sum += (Y_b * m_b).sum(dim=0).detach().cpu().double()
+        node_y2_sum += (Y_b.pow(2) * m_b).sum(dim=0).detach().cpu().double()
+
+        if return_tensors:
+            pred_chunks.append(pred.detach().cpu())
+            target_chunks.append(Y_b.detach().cpu())
+            beta_chunks.append(out["beta"].detach().cpu())
+            context_chunks.append(out["x"].detach().cpu())
+            mask_chunks.append(m_b.detach().cpu())
+
+    if total_n <= 0:
+        raise ValueError("No observational entries available for evaluation.")
+
+    mse = total_sq / total_n
+    rmse = mse ** 0.5
+    mae = total_abs / total_n
+
+    nodewise: Dict[int, Dict[str, float]] = {}
+    valid_r2 = []
+
+    for j in range(p):
+        n_j = float(node_n[j].item())
+
+        if n_j <= 0:
+            nodewise[j] = {
+                "mse": float("nan"),
+                "rmse": float("nan"),
+                "mae": float("nan"),
+                "r2": float("nan"),
+                "n_observed": 0,
+            }
+            continue
+
+        mse_j = float(node_sq[j].item()) / n_j
+        mae_j = float(node_abs[j].item()) / n_j
+        mean_j = float(node_y_sum[j].item()) / n_j
+
+        ss_tot_j = (
+            float(node_y2_sum[j].item())
+            - 2.0 * mean_j * float(node_y_sum[j].item())
+            + n_j * mean_j * mean_j
+        )
+        ss_res_j = float(node_sq[j].item())
+
+        if ss_tot_j <= 1e-12:
+            r2_j = float("nan")
+        else:
+            r2_j = 1.0 - ss_res_j / ss_tot_j
+            valid_r2.append(r2_j)
+
+        nodewise[j] = {
+            "mse": mse_j,
+            "rmse": mse_j ** 0.5,
+            "mae": mae_j,
+            "r2": r2_j,
+            "n_observed": int(n_j),
+        }
+
+    result = {
+        "mse": mse,
+        "rmse": rmse,
+        "mae": mae,
+        "r2_macro": (
+            float(np.mean(valid_r2)) if valid_r2 else float("nan")
+        ),
+        "n_observed": int(total_n),
+        "nodewise": nodewise,
+    }
+
+    if return_tensors:
+        result.update(
+            {
+                "prediction": torch.cat(pred_chunks, dim=0),
+                "target": torch.cat(target_chunks, dim=0),
+                "beta": torch.cat(beta_chunks, dim=0),
+                "context": torch.cat(context_chunks, dim=0),
+                "observational_mask": torch.cat(mask_chunks, dim=0),
+            }
+        )
+
+    return result
+
+
+@torch.no_grad()
 def evaluate_model(
     model,
     z: torch.Tensor,
     Y: torch.Tensor,
     observational_mask: Optional[torch.Tensor] = None,
-    edge_threshold: float = 1e-3,
-    return_tensors: bool = True
+    edge_threshold: float = 0.1,
+    batch_size: int = 512,
+    return_tensors: bool = False,
+    exact_eig_max_nodes: int = 256,
 ) -> Dict[str, Any]:
     """
-    Complete evaluation of the DynamicDAG model.
-
-    This function DOES NOT update model parameters.
-
-    It evaluates:
-
-    1. reconstruction loss used by the model;
-    2. masked MSE / RMSE / MAE / R^2;
-    3. nodewise metrics;
-    4. group penalty;
-    5. spectral radius;
-    6. support matrix;
-    7. thresholded adjacency;
-    8. exact DAG status;
-    9. sample-specific beta matrices;
-    10. predictions.
-
-    Parameters
-    ----------
-    model:
-        Trained DynamicDAG model.
-
-    z:
-        Context / representation input.
-        Shape: (n, input_dim)
-
-    Y:
-        Node observations.
-        Shape: (n, p)
-
-    observational_mask:
-        Shape: (n, p)
-
-        1 = observational
-        0 = intervened
-
-    edge_threshold:
-        Threshold applied to S_ij = ||alpha_ij||_2.
-
-    return_tensors:
-        If False, large tensors such as beta and predictions
-        are not stored in the returned dictionary.
+    Evaluate prediction and learned graph without changing model parameters.
     """
-
-    model.eval()
-
-    device = get_model_device(
-        model
+    prediction = _evaluate_batches(
+        model=model,
+        z=z,
+        Y=Y,
+        observational_mask=observational_mask,
+        batch_size=batch_size,
+        return_tensors=return_tensors,
     )
 
-    z = z.to(device)
-    Y = Y.to(device)
+    support = model.support_matrix().detach().cpu()
+    graph = graph_summary(support, threshold=edge_threshold)
 
-    observational_mask = move_optional_tensor(
-        observational_mask,
-        device
-    )
+    rho_est = float(model.spectral_radius_estimate().detach().cpu().item())
 
-    # --------------------------------------------------------
-    # Forward pass
-    # --------------------------------------------------------
+    if model.n_nodes <= exact_eig_max_nodes:
+        rho_exact = float(model.exact_spectral_radius().detach().cpu().item())
+    else:
+        rho_exact = None
 
-    with torch.inference_mode():
-
-        output = model(
-            z,
-            Y,
-            observational_mask
-        )
-
-        Y_hat = output["Y_hat"]
-
-        recon_loss = output[
-            "recon_loss"
-        ]
-
-        group_penalty = output[
-            "group_penalty"
-        ]
-
-        spectral_radius = output[
-            "acyc_penalty"
-        ]
-
-        S = output["S"]
-
-        beta = output["beta"]
-
-        context = output["x"]
-
-    # --------------------------------------------------------
-    # Standard prediction metrics
-    # --------------------------------------------------------
-
-    overall_metrics = (
-        masked_regression_metrics(
-            Y_true=Y,
-            Y_pred=Y_hat,
-            observational_mask=
-                observational_mask
-        )
-    )
-
-    # --------------------------------------------------------
-    # Per-node metrics
-    # --------------------------------------------------------
-
-    node_metrics = (
-        nodewise_regression_metrics(
-            Y_true=Y,
-            Y_pred=Y_hat,
-            observational_mask=
-                observational_mask
-        )
-    )
-
-    # --------------------------------------------------------
-    # Global graph
-    # --------------------------------------------------------
-
-    S_cpu = (
-        S.detach()
-        .cpu()
-    )
-
-    adjacency = (
-        S_cpu > edge_threshold
-    ).to(torch.int64)
-
-    adjacency.fill_diagonal_(0)
-
-    graph_metrics = graph_summary(
-        support=S_cpu,
-        adjacency=adjacency
-    )
-
-    # --------------------------------------------------------
-    # Return result
-    # --------------------------------------------------------
-
-    result = {
-        # Prediction
-        "recon_loss": float(
-            recon_loss
-            .detach()
-            .cpu()
-        ),
-
-        "mse": overall_metrics["mse"],
-        "rmse": overall_metrics["rmse"],
-        "mae": overall_metrics["mae"],
-        "r2": overall_metrics["r2"],
-
-        "n_observed":
-            overall_metrics["n_observed"],
-
-        # Nodewise
-        "nodewise":
-            node_metrics,
-
-        # Regularization / graph
-        "group_penalty": float(
-            group_penalty
-            .detach()
-            .cpu()
-        ),
-
-        "spectral_radius": float(
-            spectral_radius
-            .detach()
-            .cpu()
-        ),
-
-        "edge_threshold":
-            edge_threshold,
-
-        "graph":
-            graph_metrics,
-
-        "support":
-            S_cpu,
-
-        "adjacency":
-            adjacency
+    result: Dict[str, Any] = {
+        **prediction,
+        "recon_loss": prediction["mse"],
+        "group_penalty": float(support.sum().item()),
+        "spectral_radius": rho_est,
+        "spectral_radius_exact": rho_exact,
+        "support": support,
+        "raw_adjacency": graph["raw_adjacency"],
+        "adjacency": graph["adjacency"],
+        "graph": {
+            k: v
+            for k, v in graph.items()
+            if k not in {"raw_adjacency", "adjacency"}
+        },
     }
-
-    # --------------------------------------------------------
-    # Large tensors are optional
-    # --------------------------------------------------------
-
-    if return_tensors:
-
-        result["prediction"] = (
-            Y_hat.detach().cpu()
-        )
-
-        result["target"] = (
-            Y.detach().cpu()
-        )
-
-        result["beta"] = (
-            beta.detach().cpu()
-        )
-
-        result["context"] = (
-            context.detach().cpu()
-        )
-
-        if observational_mask is not None:
-
-            result[
-                "observational_mask"
-            ] = (
-                observational_mask
-                .detach()
-                .cpu()
-            )
 
     return result
 
 
-# ============================================================
-# Pretty printing
-# ============================================================
-
 def print_evaluation(
     metrics: Dict[str, Any],
     split_name: str = "Validation",
-    print_nodewise: bool = True
-):
-    """
-    Pretty-print evaluation results.
-    """
-
-    graph = metrics["graph"]
+    print_nodewise: bool = False,
+) -> None:
+    g = metrics["graph"]
 
     print(
         "\n"
@@ -741,87 +366,27 @@ def print_evaluation(
         f"{split_name} results\n"
         "========================================"
     )
+    print(f"MSE                 : {metrics['mse']:.6f}")
+    print(f"RMSE                : {metrics['rmse']:.6f}")
+    print(f"MAE                 : {metrics['mae']:.6f}")
+    print(f"Macro R^2           : {metrics['r2_macro']:.6f}")
+    print(f"Observed entries    : {metrics['n_observed']}")
 
-    print(
-        f"Reconstruction loss : "
-        f"{metrics['recon_loss']:.6f}"
-    )
-
-    print(
-        f"MSE                 : "
-        f"{metrics['mse']:.6f}"
-    )
-
-    print(
-        f"RMSE                : "
-        f"{metrics['rmse']:.6f}"
-    )
-
-    print(
-        f"MAE                 : "
-        f"{metrics['mae']:.6f}"
-    )
-
-    print(
-        f"R^2                 : "
-        f"{metrics['r2']:.6f}"
-    )
-
-    print(
-        f"Observed entries    : "
-        f"{metrics['n_observed']}"
-    )
-
-    print(
-        "\n"
-        "----------------------------------------\n"
-        "Graph statistics\n"
-        "----------------------------------------"
-    )
-
-    print(
-        f"Spectral radius     : "
-        f"{metrics['spectral_radius']:.3e}"
-    )
-
-    print(
-        f"Group penalty       : "
-        f"{metrics['group_penalty']:.6f}"
-    )
-
-    print(
-        f"Threshold           : "
-        f"{metrics['edge_threshold']:.3e}"
-    )
-
-    print(
-        f"Selected edges      : "
-        f"{graph['n_edges']}"
-    )
-
-    print(
-        f"Graph density       : "
-        f"{graph['density']:.4f}"
-    )
-
-    print(
-        f"Thresholded DAG     : "
-        f"{graph['is_dag']}"
-    )
+    print("\nGraph statistics")
+    print("----------------------------------------")
+    print(f"Spectral radius (PI): {metrics['spectral_radius']:.3e}")
+    if metrics["spectral_radius_exact"] is not None:
+        print(f"Spectral radius exact: {metrics['spectral_radius_exact']:.3e}")
+    print(f"Raw selected edges  : {g['raw_n_edges']}")
+    print(f"Raw graph is DAG    : {g['raw_is_dag']}")
+    print(f"Cycle-safe edges    : {g['n_edges']}")
+    print(f"Cycle-safe DAG      : {g['is_dag']}")
+    print(f"Graph density       : {g['density']:.4f}")
 
     if print_nodewise:
-
-        print(
-            "\n"
-            "----------------------------------------\n"
-            "Nodewise performance\n"
-            "----------------------------------------"
-        )
-
-        for node, stat in (
-            metrics["nodewise"].items()
-        ):
-
+        print("\nNodewise performance")
+        print("----------------------------------------")
+        for node, stat in metrics["nodewise"].items():
             print(
                 f"Node {node:3d} | "
                 f"MSE={stat['mse']:.6f} | "
@@ -832,74 +397,52 @@ def print_evaluation(
             )
 
 
-# ============================================================
-# Convenience wrappers
-# ============================================================
-
 def evaluate_validation(
     model,
-    val_z,
-    val_Y,
-    val_mask=None,
-    edge_threshold=1e-3,
-    verbose=True
-):
-    """
-    Convenience wrapper for validation evaluation.
-    """
-
+    val_z: torch.Tensor,
+    val_Y: torch.Tensor,
+    val_mask: Optional[torch.Tensor] = None,
+    edge_threshold: float = 0.1,
+    batch_size: int = 512,
+    verbose: bool = False,
+) -> Dict[str, Any]:
     metrics = evaluate_model(
         model=model,
         z=val_z,
         Y=val_Y,
         observational_mask=val_mask,
         edge_threshold=edge_threshold,
-        return_tensors=False
+        batch_size=batch_size,
+        return_tensors=False,
     )
 
     if verbose:
-
-        print_evaluation(
-            metrics,
-            split_name="Validation",
-            print_nodewise=False
-        )
+        print_evaluation(metrics, split_name="Validation", print_nodewise=False)
 
     return metrics
 
 
 def evaluate_test(
     model,
-    test_z,
-    test_Y,
-    test_mask=None,
-    edge_threshold=1e-3,
-    verbose=True,
-    return_tensors=True
-):
-    """
-    Convenience wrapper for final test evaluation.
-
-    Ideally this should be called only after all
-    hyperparameters / checkpoints have been selected
-    using the validation set.
-    """
-
+    test_z: torch.Tensor,
+    test_Y: torch.Tensor,
+    test_mask: Optional[torch.Tensor] = None,
+    edge_threshold: float = 0.1,
+    batch_size: int = 512,
+    verbose: bool = True,
+    return_tensors: bool = True,
+) -> Dict[str, Any]:
     metrics = evaluate_model(
         model=model,
         z=test_z,
         Y=test_Y,
         observational_mask=test_mask,
         edge_threshold=edge_threshold,
-        return_tensors=return_tensors
+        batch_size=batch_size,
+        return_tensors=return_tensors,
     )
 
     if verbose:
-
-        print_evaluation(
-            metrics,
-            split_name="Test",
-            print_nodewise=True
-        )
+        print_evaluation(metrics, split_name="Test", print_nodewise=True)
 
     return metrics
