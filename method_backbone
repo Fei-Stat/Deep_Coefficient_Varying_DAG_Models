@@ -1,0 +1,256 @@
+import torch
+import torch.nn as nn
+
+
+class DynamicDAG(nn.Module):
+
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        context_dim,
+        n_nodes,
+        dropout=0.0,
+    ):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.context_dim = context_dim
+        self.n_nodes = n_nodes
+
+        # =====================================================
+        # A multi-layer perceptron for reducing the dimension
+        # of represented data.
+        # =====================================================
+
+        self.projector = nn.Sequential(
+            nn.Linear(
+                input_dim,
+                hidden_dim
+            ),
+            nn.GELU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            ),
+            nn.GELU(),
+
+            nn.Linear(
+                hidden_dim,
+                context_dim
+            )
+        )
+
+        # alpha[i, j, s]
+        #
+        # static parameters shared by all samples
+        self.alpha = nn.Parameter(
+            0.01 * torch.randn(
+                n_nodes,
+                n_nodes,
+                context_dim
+            )
+        )
+
+        # no self loops
+        offdiag = (
+            1.0
+            - torch.eye(n_nodes)
+        )
+
+        self.register_buffer(
+            "offdiag_mask",
+            offdiag
+        )
+
+    # =========================================================
+    # A multi-layer perceptron for reducing the dimension
+    # of represented data.
+    # =========================================================
+
+    def encode_context(self, z):
+
+        x = self.projector(z)
+
+        return x
+
+    # =========================================================
+    # To compute beta.
+    #
+    # beta[k, i, j]
+    #   = sum_s alpha[i,j,s] x[k,s]
+    # =========================================================
+
+    def compute_beta(self, x):
+
+        alpha = (
+            self.alpha
+            * self.offdiag_mask[:, :, None]
+        )
+
+        beta = torch.einsum(
+            "ks,ijs->kij",
+            x,
+            alpha
+        )
+
+        return beta
+
+    # =========================================================
+    # To compute nodewise.
+    #
+    # Y_hat[k,j]
+    #   = sum_i beta[k,i,j] Y[k,i]
+    # =========================================================
+
+    def nodewise_prediction(
+        self,
+        Y,
+        beta
+    ):
+
+        Y_hat = torch.einsum(
+            "ki,kij->kj",
+            Y,
+            beta
+        )
+
+        return Y_hat
+
+    # =========================================================
+    # Reconstruction loss.
+    # =========================================================
+
+    def reconstruction_loss(
+        self,
+        Y,
+        Y_hat,
+        observational_mask=None,
+        normalize=True,
+    ):
+
+        residual_sq = (
+            Y - Y_hat
+        ) ** 2
+
+        if observational_mask is not None:
+
+            mask = observational_mask.to(
+                dtype=Y.dtype
+            )
+
+            residual_sq = (
+                residual_sq
+                * mask
+            )
+
+            if normalize:
+
+                denom = (
+                    mask.sum()
+                    .clamp_min(1.0)
+                )
+
+                return (
+                    residual_sq.sum()
+                    / denom
+                )
+
+        if normalize:
+            return residual_sq.mean()
+
+        return residual_sq.sum()
+
+    # =========================================================
+    # Global directed support.
+    #
+    # S_ij = ||alpha_ij||_2
+    # =========================================================
+
+    def support_matrix(self):
+
+        alpha = (
+            self.alpha
+            * self.offdiag_mask[:, :, None]
+        )
+
+        S = torch.linalg.vector_norm(
+            alpha,
+            ord=2,
+            dim=-1
+        )
+
+        return S
+
+    # =========================================================
+    # Definition of penalty terms.
+    # =========================================================
+
+    def group_lasso_penalty(self):
+
+        S = self.support_matrix()
+
+        return S.sum()
+
+    def spectral_acyclicity(self):
+
+        S = self.support_matrix()
+
+        eigenvalues = torch.linalg.eigvals(S)
+
+        rho = eigenvalues.abs().max()
+
+        return rho
+
+    # =========================================================
+    # Full model.
+    # =========================================================
+
+    def forward(
+        self,
+        z,
+        Y,
+        observational_mask=None,
+    ):
+
+        # representation learning
+        x = self.encode_context(z)
+
+        # sample-specific edge coefficients
+        beta = self.compute_beta(x)
+
+        # nodewise SEM predictions
+        Y_hat = self.nodewise_prediction(
+            Y,
+            beta
+        )
+
+        # reconstruction loss
+        recon_loss = self.reconstruction_loss(
+            Y,
+            Y_hat,
+            observational_mask,
+            normalize=True
+        )
+
+        # support
+        S = self.support_matrix()
+
+        # penalties
+        group_penalty = S.sum()
+
+        acyc_penalty = (
+            self.spectral_acyclicity()
+        )
+
+        return {
+            "x": x,
+            "beta": beta,
+            "Y_hat": Y_hat,
+            "S": S,
+            "recon_loss": recon_loss,
+            "group_penalty": group_penalty,
+            "acyc_penalty": acyc_penalty,
+        }
