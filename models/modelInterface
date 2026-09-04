@@ -1,1126 +1,150 @@
+"""PyTorch-Lightning interface for the untouched classification baseline."""
+
+from __future__ import annotations
+
 import importlib
-import inspect
-import random
-from pathlib import Path
+from typing import Any, Dict, Iterable, Tuple
 
-import pandas as pd
-import torch
-import torchmetrics
 import pytorch_lightning as pl
+import torch
+import torch.nn.functional as F
 
-from MyOptimizer import create_optimizer
-from MyLoss import create_loss
 
-
-def _cfg_get(cfg, key, default=None):
-    """
-    Read a value from either a dict-like config or an object config.
-    """
-
-    if cfg is None:
+def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
+    if config is None:
         return default
-
-    if isinstance(cfg, dict):
-        return cfg.get(
-            key,
-            default,
-        )
-
-    return getattr(
-        cfg,
-        key,
-        default,
-    )
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
 
 
-def _class_name_from_module(name):
-    """
-    Examples
-    --------
-    TransMIL -> TransMIL
-
-    TransMIL_regression
-        ->
-    TransMILRegression
-    """
-
-    if "_" not in name:
-        return name
-
-    parts = name.split("_")
-
-    return "".join(
-        p[0].upper() + p[1:]
-        for p in parts
-        if p
-    )
+def _model_kwargs(config: Any, excluded: Iterable[str]) -> Dict[str, Any]:
+    if isinstance(config, dict):
+        items = config.items()
+    elif hasattr(config, "items"):
+        items = config.items()
+    else:
+        items = vars(config).items()
+    excluded = set(excluded)
+    return {key: value for key, value in items if key not in excluded}
 
 
 class ModelInterface(pl.LightningModule):
-    """
-    PyTorch Lightning interface for classification models.
-    """
+    """Classification only; the DAG never passes through this interface."""
 
     def __init__(
         self,
-        model,
-        loss,
-        optimizer,
-        **kargs,
+        model_cfg: Any,
+        optimizer_cfg: Any = None,
+        data_cfg: Any = None,
+        **_: Any,
     ):
         super().__init__()
+        self.save_hyperparameters(ignore=["model_cfg", "optimizer_cfg", "data_cfg"])
+        self.model_cfg = model_cfg
+        self.optimizer_cfg = optimizer_cfg
+        self.data_cfg = data_cfg
+        self.model = self._load_model(model_cfg)
+        self._validation_outputs = []
+        self._test_outputs = []
 
-        # --------------------------------------------------
-        # Configuration
-        # --------------------------------------------------
-        self.model_cfg = model
-        self.loss_cfg = loss
-        self.optimizer_cfg = optimizer
+    @staticmethod
+    def _load_model(model_cfg: Any):
+        module_name = _cfg_get(model_cfg, "name", "TransMIL")
+        class_name = _cfg_get(model_cfg, "class_name", "TransMIL")
+        module = importlib.import_module(f"models.{module_name}")
+        model_class = getattr(module, class_name)
+        kwargs = _model_kwargs(model_cfg, {"name", "class_name"})
+        return model_class(**kwargs)
 
-        self.data_cfg = kargs.get(
-            "data",
-            None,
-        )
+    def _prepare_batch(self, batch: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+            raise ValueError("Classification batch must be (features, labels, ...).")
+        features, labels = batch[0], batch[1]
 
-        self.model_tag = kargs.get(
-            "model_tag",
-            "UNDEFINED_MODEL",
-        )
-
-        self.csv_dir = Path(
-            kargs.get(
-                "csv_dir",
-                "output_csv",
-            )
-        )
-
-        self.csv_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        self.csv_file_name = kargs.get(
-            "csv_file_name",
-            "val_metrics.csv",
-        )
-
-        self.csv_path = (
-            self.csv_dir
-            / self.csv_file_name
-        )
-
-        self.log_path = Path(
-            kargs.get(
-                "log",
-                "logs",
-            )
-        )
-
-        self.log_path.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        self.shuffle = bool(
-            _cfg_get(
-                self.data_cfg,
-                "data_shuffle",
-                False,
-            )
-        )
-
-        self.count = 0
-
-        self.dropout = float(
-            _cfg_get(
-                model,
-                "dropout",
-                kargs.get(
-                    "dropout",
-                    0.25,
-                ),
-            )
-        )
-
-        self.save_hyperparameters()
-
-        # --------------------------------------------------
-        # Model
-        # --------------------------------------------------
-        self.model = self._load_model(
-            self.model_cfg
-        )
-
-        self.n_classes = int(
-            self.model.n_classes
-        )
-
-        # --------------------------------------------------
-        # Loss
-        # --------------------------------------------------
-        self.register_buffer(
-            "class_weights",
-            torch.ones(
-                self.n_classes
-            ),
-        )
-
-        # Keep original behavior:
-        # upsampling handled by dataset,
-        # so CE loss is unweighted.
-        self.loss = create_loss(
-            self.loss_cfg,
-            weight=None,
-        )
-
-        # --------------------------------------------------
-        # Metrics
-        # --------------------------------------------------
-        self.binary_task = (
-            self.n_classes == 2
-        )
-
-        if self.binary_task:
-
-            task = "binary"
-
-            metrics_dict = {
-                "acc":
-                    torchmetrics.Accuracy(
-                        task=task
-                    ),
-
-                "f1":
-                    torchmetrics.F1Score(
-                        task=task
-                    ),
-
-                "kappa":
-                    torchmetrics.CohenKappa(
-                        task=task
-                    ),
-
-                "recall":
-                    torchmetrics.Recall(
-                        task=task
-                    ),
-
-                "precision":
-                    torchmetrics.Precision(
-                        task=task
-                    ),
-
-                "spec":
-                    torchmetrics.Specificity(
-                        task=task
-                    ),
-
-                # For binary classification,
-                # Top-1 is ordinary accuracy.
-                "acc_top1":
-                    torchmetrics.Accuracy(
-                        task=task
-                    ),
-
-                # Top-3 is not mathematically meaningful
-                # with two classes. Kept only for old CSV
-                # compatibility.
-                "acc_top3":
-                    torchmetrics.Accuracy(
-                        task=task
-                    ),
-            }
-
-            self.AUROC = torchmetrics.AUROC(
-                task=task
-            )
-
-            self.conf_matrix = (
-                torchmetrics.ConfusionMatrix(
-                    task=task
-                )
-            )
-
-        else:
-
-            task = "multiclass"
-
-            top3_k = min(
-                3,
-                self.n_classes,
-            )
-
-            metrics_dict = {
-                "acc":
-                    torchmetrics.Accuracy(
-                        task=task,
-                        num_classes=self.n_classes,
-                        average="micro",
-                    ),
-
-                "f1":
-                    torchmetrics.F1Score(
-                        task=task,
-                        num_classes=self.n_classes,
-                        average="macro",
-                    ),
-
-                "kappa":
-                    torchmetrics.CohenKappa(
-                        task=task,
-                        num_classes=self.n_classes,
-                    ),
-
-                "recall":
-                    torchmetrics.Recall(
-                        task=task,
-                        num_classes=self.n_classes,
-                        average="macro",
-                    ),
-
-                "precision":
-                    torchmetrics.Precision(
-                        task=task,
-                        num_classes=self.n_classes,
-                        average="macro",
-                    ),
-
-                "spec":
-                    torchmetrics.Specificity(
-                        task=task,
-                        num_classes=self.n_classes,
-                        average="macro",
-                    ),
-
-                "acc_top1":
-                    torchmetrics.Accuracy(
-                        task=task,
-                        num_classes=self.n_classes,
-                        top_k=1,
-                    ),
-
-                "acc_top3":
-                    torchmetrics.Accuracy(
-                        task=task,
-                        num_classes=self.n_classes,
-                        top_k=top3_k,
-                    ),
-            }
-
-            self.AUROC = torchmetrics.AUROC(
-                task=task,
-                num_classes=self.n_classes,
-                average="macro",
-            )
-
-            self.conf_matrix = (
-                torchmetrics.ConfusionMatrix(
-                    task=task,
-                    num_classes=self.n_classes,
-                )
-            )
-
-        metrics = torchmetrics.MetricCollection(
-            metrics_dict
-        )
-
-        self.valid_metrics = metrics.clone(
-            prefix="val_"
-        )
-
-        self.test_metrics = metrics.clone(
-            prefix="test_"
-        )
-
-        # --------------------------------------------------
-        # Epoch buffers
-        # --------------------------------------------------
-        self.validation_step_outputs = []
-        self.test_step_outputs = []
-
-        self.train_data = self._new_class_counter()
-        self.val_data = self._new_class_counter()
-        self.test_data = self._new_class_counter()
-
-    def _new_class_counter(self):
-
-        return [
-            {
-                "count": 0,
-                "correct": 0,
-            }
-            for _ in range(
-                self.n_classes
-            )
-        ]
-
-    def _metric_probs(self, probs):
-        """
-        Binary torchmetrics expects probability for the
-        positive class, while multiclass expects [N, K].
-        """
-
-        if self.binary_task:
-            return probs[:, 1]
-
-        return probs
-
-    def _update_class_counter(
-        self,
-        storage,
-        y_hat,
-        label,
-    ):
-
-        preds = (
-            y_hat
-            .detach()
-            .view(-1)
-            .cpu()
-            .long()
-            .tolist()
-        )
-
-        targets = (
-            label
-            .detach()
-            .view(-1)
-            .cpu()
-            .long()
-            .tolist()
-        )
-
-        if len(preds) != len(targets):
-            raise ValueError(
-                "Prediction/target batch-size mismatch."
-            )
-
-        for pred, target in zip(
-            preds,
-            targets,
-        ):
-
-            if not (
-                0
-                <= target
-                < self.n_classes
-            ):
+        if isinstance(features, (list, tuple)):
+            if len(features) != 1:
                 raise ValueError(
-                    f"Invalid class label {target}."
+                    "Variable-length WSI bags require batch_size=1."
                 )
+            features = features[0].unsqueeze(0)
+        elif features.ndim == 2:
+            features = features.unsqueeze(0)
 
-            storage[target]["count"] += 1
+        labels = labels.long().reshape(-1)
+        if features.shape[0] != labels.shape[0]:
+            raise ValueError("Feature and label batch sizes differ.")
+        return features.to(self.device), labels.to(self.device)
 
-            storage[target]["correct"] += int(
-                pred == target
-            )
+    def forward(self, data: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return self.model(data=data)
 
-    def get_progress_bar_dict(self):
+    def _shared_step(self, batch: Any) -> Dict[str, torch.Tensor]:
+        features, labels = self._prepare_batch(batch)
+        output = self(features)
+        logits = output["logits"]
+        loss = F.cross_entropy(logits, labels)
+        prediction = logits.argmax(dim=-1)
+        return {"loss": loss, "prediction": prediction, "target": labels}
 
-        items = super().get_progress_bar_dict()
-
-        items.pop(
-            "v_num",
-            None,
-        )
-
-        return items
-
-    # ======================================================
-    # Training
-    # ======================================================
-    def training_step(
-        self,
-        batch,
-        batch_idx,
-    ):
-
-        data, label = batch
-
-        label = label.long()
-
-        results = self.model(
-            data=data,
-            label=label,
-        )
-
-        logits = results[
-            "logits"
-        ]
-
-        Y_hat = results[
-            "Y_hat"
-        ]
-
-        loss = self.loss(
-            logits,
-            label,
-        )
-
-        self._update_class_counter(
-            self.train_data,
-            Y_hat,
-            label,
-        )
-
+    def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        result = self._shared_step(batch)
         self.log(
-            "train_loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            batch_size=label.shape[0],
+            "train_loss", result["loss"], on_step=False, on_epoch=True,
+            prog_bar=True, batch_size=result["target"].shape[0]
+        )
+        return result["loss"]
+
+    def validation_step(self, batch: Any, batch_idx: int) -> None:
+        result = self._shared_step(batch)
+        self._validation_outputs.append(
+            {key: value.detach().cpu() for key, value in result.items()}
         )
 
-        return loss
-
-    def on_train_epoch_end(self):
-
-        total_count = sum(
-            d["count"]
-            for d in self.train_data
-        )
-
-        if total_count > 0:
-
-            self.print(
-                "\n"
-                + "=" * 32
-            )
-
-            self.print(
-                "Training Epoch Results"
-            )
-
-            for c in range(
-                self.n_classes
-            ):
-
-                count = (
-                    self.train_data[c]["count"]
-                )
-
-                correct = (
-                    self.train_data[c]["correct"]
-                )
-
-                acc = (
-                    correct / count
-                    if count > 0
-                    else 0.0
-                )
-
-                self.print(
-                    f"class {c}: "
-                    f"acc={acc:.4f}, "
-                    f"{correct}/{count}"
-                )
-
-            self.print(
-                "=" * 32
-            )
-
-        self.train_data = (
-            self._new_class_counter()
-        )
-
-    # ======================================================
-    # Validation
-    # ======================================================
-    def validation_step(
-        self,
-        batch,
-        batch_idx,
-    ):
-
-        data, label = batch
-        label = label.long()
-
-        results = self.model(
-            data=data,
-            label=label,
-        )
-
-        logits = results[
-            "logits"
-        ]
-
-        probs = results[
-            "Y_prob"
-        ]
-
-        Y_hat = results[
-            "Y_hat"
-        ]
-
-        loss = self.loss(
-            logits,
-            label,
-        )
-
-        self._update_class_counter(
-            self.val_data,
-            Y_hat,
-            label,
-        )
-
-        self.validation_step_outputs.append(
-            {
-                "probs":
-                    probs.detach().cpu(),
-
-                "label":
-                    label.detach().cpu(),
-
-                "loss":
-                    loss.detach().cpu(),
-            }
-        )
-
-        return loss
-
-    def on_validation_epoch_end(self):
-
-        if not self.validation_step_outputs:
+    def on_validation_epoch_end(self) -> None:
+        if not self._validation_outputs:
             return
+        losses = torch.stack([item["loss"] for item in self._validation_outputs])
+        predictions = torch.cat(
+            [item["prediction"] for item in self._validation_outputs]
+        )
+        targets = torch.cat([item["target"] for item in self._validation_outputs])
+        accuracy = (predictions == targets).float().mean()
+        self.log("val_loss", losses.mean().to(self.device), prog_bar=True)
+        self.log("val_accuracy", accuracy.to(self.device), prog_bar=True)
+        self._validation_outputs.clear()
 
-        probs = torch.cat(
-            [
-                x["probs"]
-                for x
-                in self.validation_step_outputs
-            ],
-            dim=0,
+    def test_step(self, batch: Any, batch_idx: int) -> None:
+        result = self._shared_step(batch)
+        self._test_outputs.append(
+            {key: value.detach().cpu() for key, value in result.items()}
         )
 
-        target = torch.cat(
-            [
-                x["label"]
-                for x
-                in self.validation_step_outputs
-            ],
-            dim=0,
-        ).long()
-
-        val_loss = torch.stack(
-            [
-                x["loss"]
-                for x
-                in self.validation_step_outputs
-            ]
-        ).mean()
-
-        metric_probs = self._metric_probs(
-            probs
-        ).to(
-            self.device
-        )
-
-        target_device = target.to(
-            self.device
-        )
-
-        val_results = self.valid_metrics(
-            metric_probs,
-            target_device,
-        )
-
-        auc_val = self.AUROC(
-            metric_probs,
-            target_device,
-        )
-
-        cm = self.conf_matrix(
-            metric_probs,
-            target_device,
-        )
-
-        val_results["val_auc"] = (
-            auc_val
-        )
-
-        val_results["val_loss"] = (
-            val_loss.to(
-                self.device
-            )
-        )
-
-        val_results["val_top1_err"] = (
-            1
-            - val_results[
-                "val_acc_top1"
-            ]
-        )
-
-        val_results["val_top3_err"] = (
-            1
-            - val_results[
-                "val_acc_top3"
-            ]
-        )
-
-        self.log_dict(
-            val_results,
-            prog_bar=False,
-            on_epoch=True,
-            sync_dist=True,
-        )
-
-        if not self.trainer.sanity_checking:
-
-            self.print(
-                "\n"
-                + "=" * 40
-            )
-
-            self.print(
-                f"Epoch {self.current_epoch}"
-            )
-
-            self.print(
-                f"Loss     : "
-                f"{float(val_loss):.4f}"
-            )
-
-            self.print(
-                f"Accuracy : "
-                f"{float(val_results['val_acc']):.4f}"
-            )
-
-            self.print(
-                f"Macro-F1 : "
-                f"{float(val_results['val_f1']):.4f}"
-            )
-
-            self.print(
-                f"AUC      : "
-                f"{float(auc_val):.4f}"
-            )
-
-            self.print(
-                "\nConfusion Matrix:"
-            )
-
-            self.print(cm)
-
-            self.print(
-                "\nPer-class validation accuracy:"
-            )
-
-            row = {
-                "epoch":
-                    int(
-                        self.current_epoch
-                    ),
-
-                "model_tag":
-                    self.model_tag,
-
-                "val_loss":
-                    float(
-                        val_loss
-                    ),
-
-                "val_acc":
-                    float(
-                        val_results[
-                            "val_acc"
-                        ]
-                    ),
-
-                "val_f1":
-                    float(
-                        val_results[
-                            "val_f1"
-                        ]
-                    ),
-
-                "val_auc":
-                    float(
-                        auc_val
-                    ),
-
-                "val_top1_err":
-                    float(
-                        val_results[
-                            "val_top1_err"
-                        ]
-                    ),
-
-                "val_top3_err":
-                    float(
-                        val_results[
-                            "val_top3_err"
-                        ]
-                    ),
-            }
-
-            for c in range(
-                self.n_classes
-            ):
-
-                count = (
-                    self.val_data[c]["count"]
-                )
-
-                correct = (
-                    self.val_data[c]["correct"]
-                )
-
-                acc = (
-                    correct / count
-                    if count > 0
-                    else 0.0
-                )
-
-                self.print(
-                    f"class {c}: "
-                    f"acc={acc:.4f}, "
-                    f"{correct}/{count}"
-                )
-
-                row[
-                    f"val_acc_class_{c}"
-                ] = acc
-
-            self.print(
-                "=" * 40
-            )
-
-            if self.trainer.is_global_zero:
-
-                write_header = (
-                    not self.csv_path.exists()
-                )
-
-                pd.DataFrame(
-                    [row]
-                ).to_csv(
-                    self.csv_path,
-                    mode="a",
-                    header=write_header,
-                    index=False,
-                )
-
-        self.val_data = (
-            self._new_class_counter()
-        )
-
-        self.validation_step_outputs.clear()
-
-        if self.shuffle:
-            self.count += 1
-
-            random.seed(
-                self.count * 50
-            )
-
-    # ======================================================
-    # Test
-    # ======================================================
-    def test_step(
-        self,
-        batch,
-        batch_idx,
-    ):
-
-        data, label = batch
-        label = label.long()
-
-        results = self.model(
-            data=data,
-            label=label,
-        )
-
-        probs = results[
-            "Y_prob"
-        ]
-
-        Y_hat = results[
-            "Y_hat"
-        ]
-
-        self._update_class_counter(
-            self.test_data,
-            Y_hat,
-            label,
-        )
-
-        self.test_step_outputs.append(
-            {
-                "probs":
-                    probs.detach().cpu(),
-
-                "label":
-                    label.detach().cpu(),
-            }
-        )
-
-    def on_test_epoch_end(self):
-
-        if not self.test_step_outputs:
-
-            self.print(
-                "[ERROR] No test data processed."
-            )
-
+    def on_test_epoch_end(self) -> None:
+        if not self._test_outputs:
             return
+        predictions = torch.cat([x["prediction"] for x in self._test_outputs])
+        targets = torch.cat([x["target"] for x in self._test_outputs])
+        accuracy = (predictions == targets).float().mean()
+        self.log("test_accuracy", accuracy.to(self.device))
+        self._test_outputs.clear()
 
-        probs = torch.cat(
-            [
-                x["probs"]
-                for x
-                in self.test_step_outputs
-            ],
-            dim=0,
-        )
-
-        target = torch.cat(
-            [
-                x["label"]
-                for x
-                in self.test_step_outputs
-            ],
-            dim=0,
-        ).long()
-
-        metric_probs = self._metric_probs(
-            probs
-        ).to(
-            self.device
-        )
-
-        target_device = target.to(
-            self.device
-        )
-
-        metrics = self.test_metrics(
-            metric_probs,
-            target_device,
-        )
-
-        auc_val = self.AUROC(
-            metric_probs,
-            target_device,
-        )
-
-        metrics["test_auc"] = (
-            auc_val
-        )
-
-        self.print(
-            "\n"
-            + "=" * 40
-        )
-
-        self.print(
-            "FINAL TEST"
-        )
-
-        for key, value in metrics.items():
-
-            self.print(
-                f"{key}: "
-                f"{float(value):.4f}"
-            )
-
-        self.print(
-            "\nPer-class test accuracy:"
-        )
-
-        for c in range(
-            self.n_classes
-        ):
-
-            count = (
-                self.test_data[c]["count"]
-            )
-
-            correct = (
-                self.test_data[c]["correct"]
-            )
-
-            acc = (
-                correct / count
-                if count > 0
-                else 0.0
-            )
-
-            self.print(
-                f"class {c}: "
-                f"acc={acc:.4f}, "
-                f"{correct}/{count}"
-            )
-
-        self.print(
-            "=" * 40
-        )
-
-        if self.trainer.is_global_zero:
-
-            result = {
-                key: float(
-                    value.detach().cpu()
-                )
-                for key, value
-                in metrics.items()
-            }
-
-            pd.DataFrame(
-                [result]
-            ).to_csv(
-                self.log_path
-                / "result.csv",
-                index=False,
-            )
-
-        self.test_data = (
-            self._new_class_counter()
-        )
-
-        self.test_step_outputs.clear()
-
-    # ======================================================
-    # Optimizer
-    # ======================================================
     def configure_optimizers(self):
-
-        optimizer = create_optimizer(
-            self.optimizer_cfg,
-            self.model,
-        )
-
-        return [optimizer]
-
-    # ======================================================
-    # Model loading
-    # ======================================================
-    def _load_model(
-        self,
-        model_cfg,
-    ):
-
-        name = _cfg_get(
-            model_cfg,
-            "name",
-            None,
-        )
-
-        if name is None:
-            raise ValueError(
-                "model.name is required."
+        name = str(_cfg_get(self.optimizer_cfg, "name", "AdamW")).lower()
+        learning_rate = float(_cfg_get(self.optimizer_cfg, "lr", 1e-4))
+        weight_decay = float(_cfg_get(self.optimizer_cfg, "weight_decay", 1e-4))
+        if name == "adam":
+            return torch.optim.Adam(
+                self.parameters(), lr=learning_rate, weight_decay=weight_decay
             )
-
-        class_name = (
-            _class_name_from_module(
-                name
+        if name == "adamw":
+            return torch.optim.AdamW(
+                self.parameters(), lr=learning_rate, weight_decay=weight_decay
             )
-        )
-
-        try:
-
-            module = importlib.import_module(
-                f"models.{name}"
+        if name == "sgd":
+            momentum = float(_cfg_get(self.optimizer_cfg, "momentum", 0.9))
+            return torch.optim.SGD(
+                self.parameters(), lr=learning_rate,
+                weight_decay=weight_decay, momentum=momentum
             )
-
-            Model = getattr(
-                module,
-                class_name,
-            )
-
-        except Exception as exc:
-
-            raise ValueError(
-                "Invalid model module/class.\n"
-                f"Expected module: models/{name}.py\n"
-                f"Expected class : {class_name}\n"
-                f"Original error : {exc}"
-            ) from exc
-
-        signature = inspect.signature(
-            Model.__init__
-        )
-
-        params = [
-            p.name
-            for p
-            in signature.parameters.values()
-            if p.name != "self"
-        ]
-
-        kwargs = {}
-
-        for key in params:
-
-            value = _cfg_get(
-                model_cfg,
-                key,
-                None,
-            )
-
-            if value is not None:
-                kwargs[key] = value
-
-        return Model(
-            **kwargs
-        )
-
-    # ======================================================
-    # Legacy checkpoint compatibility
-    # ======================================================
-    def load_state_dict(
-        self,
-        state_dict,
-        strict=True,
-    ):
-
-        state_dict = dict(
-            state_dict
-        )
-
-        legacy_dim_key = (
-            "model._input_dim"
-        )
-
-        state_dict.pop(
-            legacy_dim_key,
-            None,
-        )
-
-        fc1_key = (
-            "model._fc1.0.weight"
-        )
-
-        if (
-            fc1_key in state_dict
-            and hasattr(
-                self.model,
-                "_build_fc1",
-            )
-        ):
-
-            input_dim = int(
-                state_dict[
-                    fc1_key
-                ].shape[1]
-            )
-
-            current_dim = int(
-                self.model._fc1[
-                    0
-                ].in_features
-            )
-
-            if (
-                input_dim
-                != current_dim
-            ):
-
-                self.model._build_fc1(
-                    input_dim
-                )
-
-        return super().load_state_dict(
-            state_dict,
-            strict=strict,
-        )
+        raise ValueError(f"Unsupported optimizer: {name}.")
