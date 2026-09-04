@@ -80,6 +80,9 @@ class ModelInterfaceRegression(pl.LightningModule):
         self.dag_cfg = dag_cfg
         self.model = self._load_model(model_cfg)
         self.is_dag_model = bool(getattr(self.model, "is_dag_model", False))
+        # Two independent optimizers are required for the two SDCD stages.
+        # Lightning permits multiple optimizers only with manual optimization.
+        self.automatic_optimization = not self.is_dag_model
 
         n_genes = int(getattr(self.model, "n_genes"))
         self.gene_ids = (
@@ -96,6 +99,7 @@ class ModelInterfaceRegression(pl.LightningModule):
         self._validation_outputs = []
         self._test_outputs = []
         self._screening_applied = False
+        self._gamma_cap: Optional[float] = None
 
     @staticmethod
     def _load_model(model_cfg: Any):
@@ -134,6 +138,8 @@ class ModelInterfaceRegression(pl.LightningModule):
             raise ValueError(
                 "gamma_schedule must be linear, power_2, or exponential."
             )
+        if self._gamma_cap is not None:
+            gamma = self._gamma_cap
         return group, gamma
 
     def _prepare_batch(
@@ -235,13 +241,19 @@ class ModelInterfaceRegression(pl.LightningModule):
             "loss": output["loss"],
             "prediction": output["Y_hat"],
             "target": target,
+            "observational_mask": (
+                torch.ones_like(target) if mask is None else mask
+            ),
             "reconstruction_loss": output["reconstruction_loss"],
             "group_penalty": output["group_penalty"],
             "acyclicity_penalty": output["acyclicity_penalty"],
             "beta": output["beta"],
             "context": output["context"],
             "support": output["support"],
+            "intercept": output["intercept"],
+            "raw_global_adjacency": output.get("raw_global_adjacency"),
             "global_adjacency": output.get("global_adjacency"),
+            "raw_patient_adjacency": output.get("raw_patient_adjacency"),
             "patient_adjacency": output.get("patient_adjacency"),
             "slide_id": slide_id,
             "lambda_group": lambda_group,
@@ -257,7 +269,7 @@ class ModelInterfaceRegression(pl.LightningModule):
         if (
             use_screening
             and not self._screening_applied
-            and self.current_epoch == self.stage1_epochs
+            and self.current_epoch >= self.stage1_epochs
         ):
             threshold = float(
                 _cfg_get(self.dag_cfg, "screening_threshold", 1e-3)
@@ -276,15 +288,9 @@ class ModelInterfaceRegression(pl.LightningModule):
             dynamic_dag.set_structural_mask(mask)
             self._screening_applied = True
 
-        if self.current_epoch == self.stage1_epochs:
-            stage2_lr = float(
-                _cfg_get(self.dag_cfg, "stage2_lr", 1e-4)
-            )
-            for optimizer in self.trainer.optimizers:
-                for group in optimizer.param_groups:
-                    group["lr"] = stage2_lr
-
     def on_before_optimizer_step(self, optimizer) -> None:
+        if self.is_dag_model:
+            return
         clip_value = _cfg_get(self.optimizer_cfg, "grad_clip", None)
         if clip_value is not None:
             torch.nn.utils.clip_grad_norm_(
@@ -298,6 +304,24 @@ class ModelInterfaceRegression(pl.LightningModule):
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         result = self._shared_step(batch)
         batch_size = result["target"].shape[0]
+
+        if self.is_dag_model:
+            stage1_optimizer, stage2_optimizer = self.optimizers()
+            optimizer = (
+                stage1_optimizer
+                if self.current_epoch < self.stage1_epochs
+                else stage2_optimizer
+            )
+            optimizer.zero_grad()
+            self.manual_backward(result["loss"])
+            clip_value = _cfg_get(self.optimizer_cfg, "grad_clip", 5.0)
+            if clip_value is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    self.parameters(), float(clip_value)
+                )
+            optimizer.step()
+            self.model.dynamic_dag.zero_forbidden_edges()
+
         self.log(
             "train_loss", result["loss"], on_step=False, on_epoch=True,
             prog_bar=True, batch_size=batch_size
@@ -311,7 +335,7 @@ class ModelInterfaceRegression(pl.LightningModule):
                 "gamma_acyclicity", float(result["gamma_acyclicity"]),
                 on_step=False, on_epoch=True, batch_size=batch_size
             )
-        return result["loss"]
+        return result["loss"].detach() if self.is_dag_model else result["loss"]
 
     @staticmethod
     def _cpu_record(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -334,22 +358,73 @@ class ModelInterfaceRegression(pl.LightningModule):
         target = torch.cat([x["target"] for x in self._validation_outputs])
 
         if self.is_dag_model:
-            # Model selection uses SEM reconstruction, not the changing penalty.
-            reconstruction = torch.stack(
-                [x["reconstruction_loss"] for x in self._validation_outputs]
-            ).mean()
+            # Checkpoint selection is based on reconstruction among raw DAGs.
+            mask = torch.cat(
+                [x["observational_mask"] for x in self._validation_outputs]
+            )
+            reconstruction = (
+                (prediction - target).square() * mask
+            ).sum() / mask.sum().clamp_min(1.0)
             support = self.model.dynamic_dag.support_matrix().detach().cpu()
             rho = self.model.dynamic_dag.spectral.estimate(
                 self.model.dynamic_dag.support_matrix()
             )
             raw_is_dag = self.model.raw_global_is_dag()
+            raw_adjacency = self.model.raw_global_adjacency()
+            invalid_penalty = float(
+                _cfg_get(self.dag_cfg, "invalid_graph_penalty", 1e6)
+            )
+            checkpoint_eligible = (
+                self.current_epoch >= self.stage1_epochs and raw_is_dag
+            )
+            feasible_loss = reconstruction + (
+                0.0 if checkpoint_eligible else invalid_penalty
+            )
+
+            freeze_gamma = bool(
+                _cfg_get(self.dag_cfg, "freeze_gamma_at_dag", True)
+            )
+            freeze_threshold = float(
+                _cfg_get(self.dag_cfg, "freeze_gamma_threshold", 0.01)
+            )
+            warmup = int(_cfg_get(self.dag_cfg, "gamma_warmup_epochs", 2))
+            if freeze_threshold > self.model.global_edge_threshold:
+                raise ValueError(
+                    "freeze_gamma_threshold must be <= global_edge_threshold."
+                )
+            _, current_gamma = self._dag_hyperparameters()
+            if (
+                freeze_gamma
+                and self.current_epoch >= self.stage1_epochs + warmup
+                and self._gamma_cap is None
+                and self.model.raw_global_is_dag(freeze_threshold)
+            ):
+                self._gamma_cap = current_gamma
+            elif freeze_gamma and self._gamma_cap is not None and not raw_is_dag:
+                self._gamma_cap = None
+
             self.log("val_loss", reconstruction.to(self.device), prog_bar=True)
+            self.log(
+                "val_feasible_loss", feasible_loss.to(self.device), prog_bar=False
+            )
             self.log("val_spectral_radius", rho.to(self.device), prog_bar=True)
             self.log("val_support_l1", support.sum().to(self.device))
+            self.log(
+                "val_raw_n_edges",
+                torch.tensor(float(raw_adjacency.sum()), device=self.device),
+            )
             self.log(
                 "val_raw_is_dag",
                 torch.tensor(float(raw_is_dag), device=self.device),
                 prog_bar=True,
+            )
+            self.log(
+                "val_checkpoint_eligible",
+                torch.tensor(float(checkpoint_eligible), device=self.device),
+            )
+            self.log(
+                "gamma_frozen",
+                torch.tensor(float(self._gamma_cap is not None), device=self.device),
             )
         else:
             mse = F.mse_loss(prediction, target)
@@ -369,11 +444,16 @@ class ModelInterfaceRegression(pl.LightningModule):
             return
         prediction = torch.cat([x["prediction"] for x in self._test_outputs])
         target = torch.cat([x["target"] for x in self._test_outputs])
-        mse = F.mse_loss(prediction, target)
-        self.log("test_reconstruction_mse", mse.to(self.device))
-        if not self.is_dag_model:
+        if self.is_dag_model:
+            mask = torch.cat(
+                [x["observational_mask"] for x in self._test_outputs]
+            )
+            mse = ((prediction - target).square() * mask).sum() / mask.sum().clamp_min(1.0)
+        else:
+            mse = F.mse_loss(prediction, target)
             pearson = _pearson_per_gene(prediction, target).mean()
             self.log("test_pearson", pearson.to(self.device))
+        self.log("test_reconstruction_mse", mse.to(self.device))
         self._test_outputs.clear()
 
     @torch.no_grad()
@@ -416,15 +496,27 @@ class ModelInterfaceRegression(pl.LightningModule):
 
     def configure_optimizers(self):
         name = str(_cfg_get(self.optimizer_cfg, "name", "AdamW")).lower()
-        default_lr = 2e-4 if self.is_dag_model else 1e-4
-        learning_rate = float(
-            _cfg_get(
-                self.dag_cfg if self.is_dag_model else self.optimizer_cfg,
-                "stage1_lr" if self.is_dag_model else "lr",
-                default_lr,
-            )
-        )
         weight_decay = float(_cfg_get(self.optimizer_cfg, "weight_decay", 1e-4))
+        if self.is_dag_model:
+            stage1_lr = float(_cfg_get(self.dag_cfg, "stage1_lr", 2e-4))
+            stage2_lr = float(_cfg_get(self.dag_cfg, "stage2_lr", 1e-4))
+            optimizer_class = {
+                "adam": torch.optim.Adam,
+                "adamw": torch.optim.AdamW,
+            }.get(name)
+            if optimizer_class is None:
+                raise ValueError("DAG training supports Adam or AdamW.")
+            # These are intentionally separate instances with separate moments.
+            return [
+                optimizer_class(
+                    self.parameters(), lr=stage1_lr, weight_decay=weight_decay
+                ),
+                optimizer_class(
+                    self.parameters(), lr=stage2_lr, weight_decay=weight_decay
+                ),
+            ]
+
+        learning_rate = float(_cfg_get(self.optimizer_cfg, "lr", 1e-4))
         if name == "adam":
             return torch.optim.Adam(
                 self.parameters(), lr=learning_rate, weight_decay=weight_decay
@@ -434,3 +526,15 @@ class ModelInterfaceRegression(pl.LightningModule):
                 self.parameters(), lr=learning_rate, weight_decay=weight_decay
             )
         raise ValueError("Regression/DAG interface supports Adam or AdamW.")
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        checkpoint["dag_training_state"] = {
+            "screening_applied": self._screening_applied,
+            "gamma_cap": self._gamma_cap,
+        }
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        state = checkpoint.get("dag_training_state", {})
+        self._screening_applied = bool(state.get("screening_applied", False))
+        gamma_cap = state.get("gamma_cap")
+        self._gamma_cap = None if gamma_cap is None else float(gamma_cap)
