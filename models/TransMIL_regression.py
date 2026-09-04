@@ -153,6 +153,7 @@ class DynamicDAG(nn.Module):
         context_transform: str = "tanh",
         power_iteration_steps: int = 15,
         alpha_init_scale: float = 1e-2,
+        use_context_intercept: bool = True,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
@@ -160,6 +161,7 @@ class DynamicDAG(nn.Module):
         self.context_dim = int(context_dim)
         self.n_nodes = int(n_nodes)
         self.context_transform = str(context_transform)
+        self.use_context_intercept = bool(use_context_intercept)
 
         self.projector = nn.Sequential(
             nn.Linear(self.input_dim, self.hidden_dim),
@@ -172,6 +174,13 @@ class DynamicDAG(nn.Module):
         self.alpha = nn.Parameter(
             alpha_init_scale
             * torch.randn(self.n_nodes, self.n_nodes, self.context_dim)
+        )
+        # Context-dependent node means prevent WSI-driven expression shifts
+        # from being spuriously explained by gene-to-gene edges.
+        self.intercept_head = (
+            nn.Linear(self.context_dim, self.n_nodes)
+            if self.use_context_intercept
+            else None
         )
         off_diagonal = 1.0 - torch.eye(self.n_nodes)
         self.register_buffer("off_diagonal", off_diagonal)
@@ -195,12 +204,24 @@ class DynamicDAG(nn.Module):
     def support_matrix(self) -> torch.Tensor:
         return torch.linalg.vector_norm(self.effective_alpha(), dim=-1)
 
+    @torch.no_grad()
+    def exact_spectral_radius(self) -> torch.Tensor:
+        eigenvalues = torch.linalg.eigvals(self.support_matrix())
+        return eigenvalues.abs().max().real
+
     def compute_beta(self, context: torch.Tensor) -> torch.Tensor:
         return torch.einsum("ks,ijs->kij", context, self.effective_alpha())
 
     @staticmethod
-    def nodewise_prediction(Y: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
-        return torch.einsum("ki,kij->kj", Y, beta)
+    def nodewise_prediction(
+        Y: torch.Tensor,
+        beta: torch.Tensor,
+        intercept: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        prediction = torch.einsum("ki,kij->kj", Y, beta)
+        if intercept is not None:
+            prediction = prediction + intercept
+        return prediction
 
     @staticmethod
     def reconstruction_loss(
@@ -236,9 +257,14 @@ class DynamicDAG(nn.Module):
     def infer_coefficients(self, embedding: torch.Tensor) -> Dict[str, torch.Tensor]:
         context = self.encode_context(embedding)
         beta = self.compute_beta(context)
+        if self.intercept_head is None:
+            intercept = context.new_zeros((context.shape[0], self.n_nodes))
+        else:
+            intercept = self.intercept_head(context)
         return {
             "context": context,
             "beta": beta,
+            "intercept": intercept,
             "support": self.support_matrix(),
         }
 
@@ -260,7 +286,9 @@ class DynamicDAG(nn.Module):
         if Y.shape[0] != embedding.shape[0]:
             raise ValueError("embedding and Y batch sizes differ.")
 
-        prediction = self.nodewise_prediction(Y, output["beta"])
+        prediction = self.nodewise_prediction(
+            Y, output["beta"], output["intercept"]
+        )
         reconstruction = self.reconstruction_loss(
             Y, prediction, observational_mask
         )
@@ -333,6 +361,7 @@ class TransMILDAG(nn.Module):
         context_transform: str = "tanh",
         power_iteration_steps: int = 15,
         alpha_init_scale: float = 1e-2,
+        use_context_intercept: bool = True,
         global_edge_threshold: float = 0.1,
         patient_edge_threshold: float = 0.1,
     ):
@@ -350,6 +379,7 @@ class TransMILDAG(nn.Module):
             context_transform=context_transform,
             power_iteration_steps=power_iteration_steps,
             alpha_init_scale=alpha_init_scale,
+            use_context_intercept=use_context_intercept,
         )
 
     def encode(self, data: torch.Tensor) -> torch.Tensor:
@@ -378,28 +408,39 @@ class TransMILDAG(nn.Module):
         self,
         beta: torch.Tensor,
         support: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> Dict[str, torch.Tensor]:
+        raw_global = (
+            support.detach() > self.global_edge_threshold
+        ).to(torch.int64)
+        raw_global.fill_diagonal_(0)
+
         # A single cycle-safe union support is shared across patients.
         global_adjacency = extract_dag_adjacency(
             support, threshold=self.global_edge_threshold
         ).to(beta.device)
-        patient_adjacency = (
+        raw_patient = (
             beta.abs() > self.patient_edge_threshold
         ).to(torch.int64)
-        patient_adjacency = patient_adjacency * global_adjacency.unsqueeze(0)
-        return global_adjacency, patient_adjacency
+        raw_patient = raw_patient * raw_global.to(beta.device).unsqueeze(0)
+        patient_adjacency = raw_patient * global_adjacency.unsqueeze(0)
+        return {
+            "raw_global_adjacency": raw_global,
+            "global_adjacency": global_adjacency,
+            "raw_patient_adjacency": raw_patient,
+            "patient_adjacency": patient_adjacency,
+            "raw_global_is_dag": torch.tensor(
+                is_dag(raw_global), dtype=torch.bool
+            ),
+        }
 
     def infer_graph(self, data: torch.Tensor) -> Dict[str, torch.Tensor]:
         embedding = self.encode(data)
         output = self.dynamic_dag(embedding=embedding)
-        global_adjacency, patient_adjacency = self._discrete_graphs(
-            output["beta"], output["support"]
-        )
+        graphs = self._discrete_graphs(output["beta"], output["support"])
         output.update(
             {
                 "embedding": embedding,
-                "global_adjacency": global_adjacency,
-                "patient_adjacency": patient_adjacency,
+                **graphs,
             }
         )
         return output
@@ -424,11 +465,9 @@ class TransMILDAG(nn.Module):
         )
         output["embedding"] = embedding
         if return_discrete_graphs:
-            global_adjacency, patient_adjacency = self._discrete_graphs(
-                output["beta"], output["support"]
+            output.update(
+                self._discrete_graphs(output["beta"], output["support"])
             )
-            output["global_adjacency"] = global_adjacency
-            output["patient_adjacency"] = patient_adjacency
         return output
 
 
