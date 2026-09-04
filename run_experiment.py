@@ -27,10 +27,10 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import pytorch_lightning as pl
 import torch
-import yaml
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 
+from experiment_config import EXPERIMENT_CONFIGS, get_experiment_config
 from models.modelInterfaceRegression import ModelInterfaceRegression
 
 
@@ -39,14 +39,6 @@ def torch_load(path: Path) -> Any:
         return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:  # PyTorch < 2.0
         return torch.load(path, map_location="cpu")
-
-
-def load_config(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as stream:
-        config = yaml.safe_load(stream)
-    if not isinstance(config, dict):
-        raise ValueError("The YAML root must be a mapping.")
-    return config
 
 
 def as_feature_sequence(value: Any) -> Sequence[Any]:
@@ -257,11 +249,18 @@ def detach_predictions(predictions: List[Dict[str, Any]]) -> List[Dict[str, Any]
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True, type=Path)
-    parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/dag"))
+    parser.add_argument(
+        "--task",
+        choices=tuple(EXPERIMENT_CONFIGS),
+        default="dag",
+        help="Experiment configuration defined in experiment_config.py.",
+    )
+    parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    config = get_experiment_config(args.task)
+    if args.output_dir is None:
+        args.output_dir = Path("outputs") / args.task
     payload = torch_load(args.data)
     if not isinstance(payload, dict):
         raise TypeError("The input .pt file must contain a dictionary.")
