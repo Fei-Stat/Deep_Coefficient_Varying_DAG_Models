@@ -1,0 +1,414 @@
+import math
+
+import torch
+import torch.nn as nn
+from nystrom_attention import NystromAttention
+
+
+class TransLayer(nn.Module):
+
+    def __init__(
+        self,
+        norm_layer=nn.LayerNorm,
+        dim=512,
+        dropout=0.1,
+    ):
+        super().__init__()
+
+        self.norm = norm_layer(dim)
+
+        self.attn = NystromAttention(
+            dim=dim,
+            dim_head=dim // 8,
+            heads=8,
+            num_landmarks=dim // 2,
+            pinv_iterations=6,
+            residual=True,
+            dropout=dropout,
+        )
+
+    def forward(self, x):
+        return x + self.attn(
+            self.norm(x)
+        )
+
+
+class PPEG(nn.Module):
+
+    def __init__(self, dim=512):
+        super().__init__()
+
+        self.proj = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size=7,
+            stride=1,
+            padding=7 // 2,
+            groups=dim,
+        )
+
+        self.proj1 = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size=5,
+            stride=1,
+            padding=5 // 2,
+            groups=dim,
+        )
+
+        self.proj2 = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size=3,
+            stride=1,
+            padding=3 // 2,
+            groups=dim,
+        )
+
+    def forward(self, x, H, W):
+
+        B, _, C = x.shape
+
+        cls_token = x[:, 0]
+        feat_token = x[:, 1:]
+
+        if feat_token.shape[1] != H * W:
+            raise ValueError(
+                f"PPEG expects H*W={H * W} tokens, "
+                f"but received {feat_token.shape[1]}."
+            )
+
+        cnn_feat = (
+            feat_token
+            .transpose(1, 2)
+            .contiguous()
+            .view(B, C, H, W)
+        )
+
+        x = (
+            cnn_feat
+            + self.proj(cnn_feat)
+            + self.proj1(cnn_feat)
+            + self.proj2(cnn_feat)
+        )
+
+        x = (
+            x
+            .flatten(2)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+        return torch.cat(
+            (
+                cls_token.unsqueeze(1),
+                x,
+            ),
+            dim=1,
+        )
+
+
+class TransMILRegression(nn.Module):
+    """
+    TransMIL adapted to multi-gene expression regression.
+
+    Parameters
+    ----------
+    n_genes:
+        Number of gene-expression targets.
+
+    feat_dim:
+        Input tile feature dimension.
+
+    dropout:
+        Dropout probability.
+
+    Examples
+    --------
+    Virchow2          : 2560
+    CONCH / UNI       : 1024
+    PLIP              : 512
+    ResNet-50 trunc   : 1024
+    ResNet-50 TCGA    : 2048
+    DINO ViT-S/16     : 384
+    """
+
+    def __init__(
+        self,
+        n_genes: int,
+        feat_dim: int = 1024,
+        dropout: float = 0.25,
+    ):
+        super().__init__()
+
+        self.n_genes = int(n_genes)
+        self.feat_dim = int(feat_dim)
+        self.dropout = float(dropout)
+
+        self._build_fc1(
+            self.feat_dim
+        )
+
+        self.cls_token = nn.Parameter(
+            torch.randn(1, 1, 512)
+        )
+
+        self.pos_layer = PPEG(
+            dim=512
+        )
+
+        self.layer1 = TransLayer(
+            dim=512,
+            dropout=self.dropout,
+        )
+
+        self.layer2 = TransLayer(
+            dim=512,
+            dropout=self.dropout,
+        )
+
+        self.norm = nn.LayerNorm(
+            512
+        )
+
+        # --------------------------------------------------
+        # Regression head
+        #
+        # Keep this for the WSI -> expression baseline.
+        #
+        # When building the DAG model later,
+        # DynamicDAG should receive the 512-d embedding
+        # BEFORE this layer.
+        # --------------------------------------------------
+        self._fc2 = nn.Linear(
+            512,
+            self.n_genes,
+        )
+
+    def _build_fc1(self, feat_dim):
+
+        feat_dim = int(feat_dim)
+
+        self._fc1 = nn.Sequential(
+            nn.Linear(
+                feat_dim,
+                512,
+            ),
+            nn.ReLU(),
+            nn.Dropout(
+                self.dropout
+            ),
+        )
+
+        self.feat_dim = feat_dim
+
+    def encode(self, data):
+        """
+        WSI tile features -> slide-level embedding.
+
+        Input
+        -----
+        data:
+            [B, N_tiles, feat_dim]
+
+        Output
+        ------
+        embedding:
+            [B, 512]
+        """
+
+        h = data.float()
+
+        if h.ndim != 3:
+            raise ValueError(
+                "Expected data shape [B, N_tiles, feat_dim], "
+                f"but received {tuple(h.shape)}."
+            )
+
+        if h.shape[1] == 0:
+            raise ValueError(
+                "A WSI bag must contain at least one tile."
+            )
+
+        if h.shape[-1] != self.feat_dim:
+            raise ValueError(
+                f"Model configured for feat_dim={self.feat_dim}, "
+                f"but input has dimension {h.shape[-1]}."
+            )
+
+        # --------------------------------------------------
+        # Input projection
+        # --------------------------------------------------
+        h = self._fc1(h)
+
+        # --------------------------------------------------
+        # Square padding
+        # --------------------------------------------------
+        N = h.shape[1]
+
+        H = int(
+            math.ceil(
+                math.sqrt(N)
+            )
+        )
+
+        W = H
+
+        add_length = H * W - N
+
+        if add_length > 0:
+            h = torch.cat(
+                [
+                    h,
+                    h[:, :add_length, :],
+                ],
+                dim=1,
+            )
+
+        # --------------------------------------------------
+        # CLS
+        # --------------------------------------------------
+        B = h.shape[0]
+
+        cls_tokens = self.cls_token.expand(
+            B,
+            -1,
+            -1,
+        )
+
+        h = torch.cat(
+            (
+                cls_tokens,
+                h,
+            ),
+            dim=1,
+        )
+
+        # --------------------------------------------------
+        # TransMIL backbone
+        # --------------------------------------------------
+        h = self.layer1(h)
+
+        h = self.pos_layer(
+            h,
+            H,
+            W,
+        )
+
+        h = self.layer2(h)
+
+        # --------------------------------------------------
+        # Slide-level embedding
+        #
+        # [B, 512]
+        # --------------------------------------------------
+        embedding = self.norm(h)[:, 0]
+
+        return embedding
+
+    def forward(self, **kwargs):
+
+        if "data" not in kwargs:
+            raise KeyError(
+                "TransMILRegression.forward() requires `data`."
+            )
+
+        data = kwargs["data"]
+
+        embedding = self.encode(
+            data
+        )
+
+        # --------------------------------------------------
+        # Continuous gene-expression prediction
+        #
+        # NO softmax
+        # NO argmax
+        # --------------------------------------------------
+        preds = self._fc2(
+            embedding
+        )
+
+        return {
+            # Compatibility with older interface.
+            "logits": preds,
+
+            # Correct regression name.
+            "preds": preds,
+
+            # Important for future DynamicDAG.
+            "embedding": embedding,
+        }
+
+
+if __name__ == "__main__":
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    B = 2
+    N_tiles = 300
+
+    # ======================================================
+    # Virchow2 example
+    # ======================================================
+    D = 2560
+
+    data = torch.randn(
+        B,
+        N_tiles,
+        D,
+        device=device,
+    )
+
+    model = TransMILRegression(
+        n_genes=4,
+        feat_dim=D,
+    ).to(device)
+
+    model.eval()
+
+    with torch.no_grad():
+        out = model(
+            data=data
+        )
+
+    print(
+        "Virchow preds:",
+        out["preds"].shape,
+    )
+
+    print(
+        "Virchow embedding:",
+        out["embedding"].shape,
+    )
+
+    # ======================================================
+    # 1024-d extractor example
+    # ======================================================
+    D = 1024
+
+    data = torch.randn(
+        B,
+        N_tiles,
+        D,
+        device=device,
+    )
+
+    model = TransMILRegression(
+        n_genes=4,
+        feat_dim=D,
+    ).to(device)
+
+    model.eval()
+
+    with torch.no_grad():
+        out = model(
+            data=data
+        )
+
+    print(
+        "1024-d preds:",
+        out["preds"].shape,
+    )
