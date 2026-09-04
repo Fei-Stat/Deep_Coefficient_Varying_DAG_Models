@@ -1,137 +1,295 @@
-import math
+"""Gene-expression regression baseline and image-conditioned DAG model.
 
+This module deliberately contains two separate model classes so the repository
+can keep the original four-script layout:
+
+``TransMILRegression``
+    WSI -> gene-expression prediction. This is a baseline only.
+
+``TransMILDAG``
+    WSI -> slide embedding -> patient-specific DAG coefficients. The regression
+    head is completely bypassed. Paired expression Y is required only while
+    fitting/evaluating the structural-equation loss, not for graph inference.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Optional
+
+import numpy as np
 import torch
 import torch.nn as nn
-from nystrom_attention import NystromAttention
+
+try:
+    from .TransMIL import TransMILBackbone
+except ImportError:  # permits: python models/TransMIL_regression.py
+    from TransMIL import TransMILBackbone
 
 
-class TransLayer(nn.Module):
+def _normalize_vector(vector: torch.Tensor, eps: float) -> torch.Tensor:
+    return vector / torch.linalg.vector_norm(vector).clamp_min(eps)
+
+
+def _has_path(adjacency: np.ndarray, source: int, target: int) -> bool:
+    if source == target:
+        return True
+    seen = np.zeros(adjacency.shape[0], dtype=bool)
+    stack = [source]
+    seen[source] = True
+    while stack:
+        node = stack.pop()
+        for child in np.flatnonzero(adjacency[node]):
+            child = int(child)
+            if child == target:
+                return True
+            if not seen[child]:
+                seen[child] = True
+                stack.append(child)
+    return False
+
+
+def is_dag(adjacency: torch.Tensor) -> bool:
+    array = (adjacency.detach().cpu().numpy() != 0).astype(np.int64)
+    if array.ndim != 2 or array.shape[0] != array.shape[1]:
+        raise ValueError("adjacency must be a square matrix.")
+    indegree = array.sum(axis=0)
+    stack = list(np.flatnonzero(indegree == 0))
+    visited = 0
+    while stack:
+        node = int(stack.pop())
+        visited += 1
+        for child in np.flatnonzero(array[node]):
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                stack.append(int(child))
+    return visited == array.shape[0]
+
+
+def extract_dag_adjacency(
+    strength: torch.Tensor,
+    threshold: float,
+) -> torch.Tensor:
+    """Greedily retain strong edges without introducing a directed cycle."""
+    if threshold < 0:
+        raise ValueError("threshold must be nonnegative.")
+    matrix = strength.detach().cpu().numpy()
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("strength must be a square matrix.")
+
+    p = matrix.shape[0]
+    candidates = [
+        (float(matrix[i, j]), i, j)
+        for i in range(p)
+        for j in range(p)
+        if i != j and matrix[i, j] > threshold
+    ]
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    adjacency = np.zeros((p, p), dtype=np.int64)
+    for _, parent, child in candidates:
+        if not _has_path(adjacency, child, parent):
+            adjacency[parent, child] = 1
+    return torch.from_numpy(adjacency)
+
+
+class PowerIterationSpectralPenalty(nn.Module):
+    """SDCD-style spectral-radius gradient surrogate for nonnegative support."""
+
+    def __init__(self, n_nodes: int, n_steps: int = 15, eps: float = 1e-6):
+        super().__init__()
+        self.n_nodes = int(n_nodes)
+        self.n_steps = int(n_steps)
+        self.eps = float(eps)
+        initial = torch.ones(self.n_nodes, dtype=torch.float32)
+        initial = _normalize_vector(initial, self.eps)
+        self.register_buffer("left", initial.clone())
+        self.register_buffer("right", initial.clone())
+
+    @torch.no_grad()
+    def reset(self) -> None:
+        self.left.fill_(1.0)
+        self.right.fill_(1.0)
+        self.left.copy_(_normalize_vector(self.left, self.eps))
+        self.right.copy_(_normalize_vector(self.right, self.eps))
+
+    @torch.no_grad()
+    def iterate(self, support: torch.Tensor) -> None:
+        matrix = support.detach() + self.eps
+        for _ in range(self.n_steps):
+            self.left.copy_(
+                _normalize_vector(matrix.T @ self.left, self.eps)
+            )
+            self.right.copy_(
+                _normalize_vector(matrix @ self.right, self.eps)
+            )
+
+    def surrogate(self, support: torch.Tensor) -> torch.Tensor:
+        self.iterate(support)
+        denominator = torch.dot(self.left, self.right).clamp_min(self.eps)
+        gradient = torch.outer(self.left, self.right) / denominator
+        return (gradient.detach() * support).sum()
+
+    @torch.no_grad()
+    def estimate(self, support: torch.Tensor) -> torch.Tensor:
+        self.iterate(support)
+        denominator = torch.dot(self.left, self.right).clamp_min(self.eps)
+        value = torch.dot(self.left, support @ self.right) / denominator
+        return value.clamp_min(0.0)
+
+
+class DynamicDAG(nn.Module):
+    """Low-rank varying-coefficient linear structural equation model.
+
+    ``alpha[i, j, s]`` belongs to edge i -> j and basis/context component s.
+    ``beta[k, i, j]`` is the corresponding coefficient for patient k.
+    """
 
     def __init__(
         self,
-        norm_layer=nn.LayerNorm,
-        dim=512,
-        dropout=0.1,
+        input_dim: int,
+        hidden_dim: int,
+        context_dim: int,
+        n_nodes: int,
+        dropout: float = 0.0,
+        context_transform: str = "tanh",
+        power_iteration_steps: int = 15,
+        alpha_init_scale: float = 1e-2,
     ):
         super().__init__()
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.context_dim = int(context_dim)
+        self.n_nodes = int(n_nodes)
+        self.context_transform = str(context_transform)
 
-        self.norm = norm_layer(dim)
-
-        self.attn = NystromAttention(
-            dim=dim,
-            dim_head=dim // 8,
-            heads=8,
-            num_landmarks=dim // 2,
-            pinv_iterations=6,
-            residual=True,
-            dropout=dropout,
+        self.projector = nn.Sequential(
+            nn.Linear(self.input_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.context_dim),
+        )
+        self.alpha = nn.Parameter(
+            alpha_init_scale
+            * torch.randn(self.n_nodes, self.n_nodes, self.context_dim)
+        )
+        off_diagonal = 1.0 - torch.eye(self.n_nodes)
+        self.register_buffer("off_diagonal", off_diagonal)
+        self.register_buffer("structural_mask", off_diagonal.clone())
+        self.spectral = PowerIterationSpectralPenalty(
+            n_nodes=self.n_nodes,
+            n_steps=power_iteration_steps,
         )
 
-    def forward(self, x):
-        return x + self.attn(
-            self.norm(x)
-        )
+    def encode_context(self, embedding: torch.Tensor) -> torch.Tensor:
+        context = self.projector(embedding)
+        if self.context_transform == "tanh":
+            return torch.tanh(context)
+        if self.context_transform == "none":
+            return context
+        raise ValueError("context_transform must be 'tanh' or 'none'.")
 
+    def effective_alpha(self) -> torch.Tensor:
+        return self.alpha * self.structural_mask[:, :, None]
 
-class PPEG(nn.Module):
+    def support_matrix(self) -> torch.Tensor:
+        return torch.linalg.vector_norm(self.effective_alpha(), dim=-1)
 
-    def __init__(self, dim=512):
-        super().__init__()
+    def compute_beta(self, context: torch.Tensor) -> torch.Tensor:
+        return torch.einsum("ks,ijs->kij", context, self.effective_alpha())
 
-        self.proj = nn.Conv2d(
-            dim,
-            dim,
-            kernel_size=7,
-            stride=1,
-            padding=7 // 2,
-            groups=dim,
-        )
+    @staticmethod
+    def nodewise_prediction(Y: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+        return torch.einsum("ki,kij->kj", Y, beta)
 
-        self.proj1 = nn.Conv2d(
-            dim,
-            dim,
-            kernel_size=5,
-            stride=1,
-            padding=5 // 2,
-            groups=dim,
-        )
-
-        self.proj2 = nn.Conv2d(
-            dim,
-            dim,
-            kernel_size=3,
-            stride=1,
-            padding=3 // 2,
-            groups=dim,
-        )
-
-    def forward(self, x, H, W):
-
-        B, _, C = x.shape
-
-        cls_token = x[:, 0]
-        feat_token = x[:, 1:]
-
-        if feat_token.shape[1] != H * W:
+    @staticmethod
+    def reconstruction_loss(
+        Y: torch.Tensor,
+        prediction: torch.Tensor,
+        observational_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        squared_error = (Y - prediction).square()
+        if observational_mask is None:
+            return squared_error.mean()
+        if observational_mask.shape != Y.shape:
             raise ValueError(
-                f"PPEG expects H*W={H * W} tokens, "
-                f"but received {feat_token.shape[1]}."
+                "observational_mask must have the same shape as Y."
             )
+        mask = observational_mask.to(device=Y.device, dtype=Y.dtype)
+        if mask.sum() <= 0:
+            raise ValueError("observational_mask contains no observed equations.")
+        return (squared_error * mask).sum() / mask.sum()
 
-        cnn_feat = (
-            feat_token
-            .transpose(1, 2)
-            .contiguous()
-            .view(B, C, H, W)
-        )
+    @torch.no_grad()
+    def zero_forbidden_edges(self) -> None:
+        self.alpha.mul_(self.structural_mask[:, :, None])
 
-        x = (
-            cnn_feat
-            + self.proj(cnn_feat)
-            + self.proj1(cnn_feat)
-            + self.proj2(cnn_feat)
-        )
+    @torch.no_grad()
+    def set_structural_mask(self, mask: torch.Tensor) -> None:
+        if mask.shape != (self.n_nodes, self.n_nodes):
+            raise ValueError("structural mask has an invalid shape.")
+        mask = mask.to(self.structural_mask) * self.off_diagonal
+        self.structural_mask.copy_(mask)
+        self.zero_forbidden_edges()
+        self.spectral.reset()
 
-        x = (
-            x
-            .flatten(2)
-            .transpose(1, 2)
-            .contiguous()
-        )
+    def infer_coefficients(self, embedding: torch.Tensor) -> Dict[str, torch.Tensor]:
+        context = self.encode_context(embedding)
+        beta = self.compute_beta(context)
+        return {
+            "context": context,
+            "beta": beta,
+            "support": self.support_matrix(),
+        }
 
-        return torch.cat(
-            (
-                cls_token.unsqueeze(1),
-                x,
-            ),
-            dim=1,
+    def forward(
+        self,
+        embedding: torch.Tensor,
+        Y: Optional[torch.Tensor] = None,
+        observational_mask: Optional[torch.Tensor] = None,
+        lambda_group: float = 0.0,
+        gamma_acyclicity: float = 0.0,
+    ) -> Dict[str, torch.Tensor]:
+        output = self.infer_coefficients(embedding)
+        if Y is None:
+            return output
+        if Y.ndim != 2 or Y.shape[1] != self.n_nodes:
+            raise ValueError(
+                f"Y must have shape [B, {self.n_nodes}], got {tuple(Y.shape)}."
+            )
+        if Y.shape[0] != embedding.shape[0]:
+            raise ValueError("embedding and Y batch sizes differ.")
+
+        prediction = self.nodewise_prediction(Y, output["beta"])
+        reconstruction = self.reconstruction_loss(
+            Y, prediction, observational_mask
         )
+        group = output["support"].sum()
+        if gamma_acyclicity > 0:
+            acyclicity = self.spectral.surrogate(output["support"])
+        else:
+            acyclicity = reconstruction.new_zeros(())
+        total = (
+            reconstruction
+            + float(lambda_group) * group
+            + float(gamma_acyclicity) * acyclicity
+        )
+        output.update(
+            {
+                "Y_hat": prediction,
+                "loss": total,
+                "reconstruction_loss": reconstruction,
+                "group_penalty": group,
+                "acyclicity_penalty": acyclicity,
+            }
+        )
+        return output
 
 
 class TransMILRegression(nn.Module):
-    """
-    TransMIL adapted to multi-gene expression regression.
+    """WSI-to-expression regression baseline. It is not the proposed model."""
 
-    Parameters
-    ----------
-    n_genes:
-        Number of gene-expression targets.
-
-    feat_dim:
-        Input tile feature dimension.
-
-    dropout:
-        Dropout probability.
-
-    Examples
-    --------
-    Virchow2          : 2560
-    CONCH / UNI       : 1024
-    PLIP              : 512
-    ResNet-50 trunc   : 1024
-    ResNet-50 TCGA    : 2048
-    DINO ViT-S/16     : 384
-    """
+    is_dag_model = False
 
     def __init__(
         self,
@@ -140,275 +298,149 @@ class TransMILRegression(nn.Module):
         dropout: float = 0.25,
     ):
         super().__init__()
-
         self.n_genes = int(n_genes)
-        self.feat_dim = int(feat_dim)
-        self.dropout = float(dropout)
-
-        self._build_fc1(
-            self.feat_dim
+        self.backbone = TransMILBackbone(feat_dim=feat_dim, dropout=dropout)
+        self.regression_head = nn.Linear(
+            self.backbone.embedding_dim, self.n_genes
         )
 
-        self.cls_token = nn.Parameter(
-            torch.randn(1, 1, 512)
-        )
+    def encode(self, data: torch.Tensor) -> torch.Tensor:
+        return self.backbone.encode(data)
 
-        self.pos_layer = PPEG(
-            dim=512
-        )
-
-        self.layer1 = TransLayer(
-            dim=512,
-            dropout=self.dropout,
-        )
-
-        self.layer2 = TransLayer(
-            dim=512,
-            dropout=self.dropout,
-        )
-
-        self.norm = nn.LayerNorm(
-            512
-        )
-
-        # --------------------------------------------------
-        # Regression head
-        #
-        # Keep this for the WSI -> expression baseline.
-        #
-        # When building the DAG model later,
-        # DynamicDAG should receive the 512-d embedding
-        # BEFORE this layer.
-        # --------------------------------------------------
-        self._fc2 = nn.Linear(
-            512,
-            self.n_genes,
-        )
-
-    def _build_fc1(self, feat_dim):
-
-        feat_dim = int(feat_dim)
-
-        self._fc1 = nn.Sequential(
-            nn.Linear(
-                feat_dim,
-                512,
-            ),
-            nn.ReLU(),
-            nn.Dropout(
-                self.dropout
-            ),
-        )
-
-        self.feat_dim = feat_dim
-
-    def encode(self, data):
-        """
-        WSI tile features -> slide-level embedding.
-
-        Input
-        -----
-        data:
-            [B, N_tiles, feat_dim]
-
-        Output
-        ------
-        embedding:
-            [B, 512]
-        """
-
-        h = data.float()
-
-        if h.ndim != 3:
-            raise ValueError(
-                "Expected data shape [B, N_tiles, feat_dim], "
-                f"but received {tuple(h.shape)}."
-            )
-
-        if h.shape[1] == 0:
-            raise ValueError(
-                "A WSI bag must contain at least one tile."
-            )
-
-        if h.shape[-1] != self.feat_dim:
-            raise ValueError(
-                f"Model configured for feat_dim={self.feat_dim}, "
-                f"but input has dimension {h.shape[-1]}."
-            )
-
-        # --------------------------------------------------
-        # Input projection
-        # --------------------------------------------------
-        h = self._fc1(h)
-
-        # --------------------------------------------------
-        # Square padding
-        # --------------------------------------------------
-        N = h.shape[1]
-
-        H = int(
-            math.ceil(
-                math.sqrt(N)
-            )
-        )
-
-        W = H
-
-        add_length = H * W - N
-
-        if add_length > 0:
-            h = torch.cat(
-                [
-                    h,
-                    h[:, :add_length, :],
-                ],
-                dim=1,
-            )
-
-        # --------------------------------------------------
-        # CLS
-        # --------------------------------------------------
-        B = h.shape[0]
-
-        cls_tokens = self.cls_token.expand(
-            B,
-            -1,
-            -1,
-        )
-
-        h = torch.cat(
-            (
-                cls_tokens,
-                h,
-            ),
-            dim=1,
-        )
-
-        # --------------------------------------------------
-        # TransMIL backbone
-        # --------------------------------------------------
-        h = self.layer1(h)
-
-        h = self.pos_layer(
-            h,
-            H,
-            W,
-        )
-
-        h = self.layer2(h)
-
-        # --------------------------------------------------
-        # Slide-level embedding
-        #
-        # [B, 512]
-        # --------------------------------------------------
-        embedding = self.norm(h)[:, 0]
-
-        return embedding
-
-    def forward(self, **kwargs):
-
-        if "data" not in kwargs:
-            raise KeyError(
-                "TransMILRegression.forward() requires `data`."
-            )
-
-        data = kwargs["data"]
-
-        embedding = self.encode(
-            data
-        )
-
-        # --------------------------------------------------
-        # Continuous gene-expression prediction
-        #
-        # NO softmax
-        # NO argmax
-        # --------------------------------------------------
-        preds = self._fc2(
-            embedding
-        )
-
+    def forward(self, data: torch.Tensor, **_: object) -> Dict[str, torch.Tensor]:
+        embedding = self.encode(data)
+        prediction = self.regression_head(embedding)
         return {
-            # Compatibility with older interface.
-            "logits": preds,
-
-            # Correct regression name.
-            "preds": preds,
-
-            # Important for future DynamicDAG.
+            "preds": prediction,
+            "logits": prediction,
             "embedding": embedding,
         }
 
 
+class TransMILDAG(nn.Module):
+    """Proposed model: WSI directly determines patient-specific DAG weights."""
+
+    is_dag_model = True
+
+    def __init__(
+        self,
+        n_genes: int,
+        feat_dim: int = 1024,
+        dropout: float = 0.25,
+        dag_hidden_dim: int = 128,
+        context_dim: int = 16,
+        dag_dropout: float = 0.0,
+        context_transform: str = "tanh",
+        power_iteration_steps: int = 15,
+        alpha_init_scale: float = 1e-2,
+        global_edge_threshold: float = 0.1,
+        patient_edge_threshold: float = 0.1,
+    ):
+        super().__init__()
+        self.n_genes = int(n_genes)
+        self.global_edge_threshold = float(global_edge_threshold)
+        self.patient_edge_threshold = float(patient_edge_threshold)
+        self.backbone = TransMILBackbone(feat_dim=feat_dim, dropout=dropout)
+        self.dynamic_dag = DynamicDAG(
+            input_dim=self.backbone.embedding_dim,
+            hidden_dim=dag_hidden_dim,
+            context_dim=context_dim,
+            n_nodes=self.n_genes,
+            dropout=dag_dropout,
+            context_transform=context_transform,
+            power_iteration_steps=power_iteration_steps,
+            alpha_init_scale=alpha_init_scale,
+        )
+
+    def encode(self, data: torch.Tensor) -> torch.Tensor:
+        return self.backbone.encode(data)
+
+    @torch.no_grad()
+    def raw_global_adjacency(
+        self,
+        threshold: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Plain thresholded support, retained to diagnose DAG convergence."""
+        if threshold is None:
+            threshold = self.global_edge_threshold
+        adjacency = (
+            self.dynamic_dag.support_matrix() > float(threshold)
+        ).to(torch.int64)
+        adjacency.fill_diagonal_(0)
+        return adjacency
+
+    @torch.no_grad()
+    def raw_global_is_dag(self, threshold: Optional[float] = None) -> bool:
+        return is_dag(self.raw_global_adjacency(threshold))
+
+    @torch.no_grad()
+    def _discrete_graphs(
+        self,
+        beta: torch.Tensor,
+        support: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # A single cycle-safe union support is shared across patients.
+        global_adjacency = extract_dag_adjacency(
+            support, threshold=self.global_edge_threshold
+        ).to(beta.device)
+        patient_adjacency = (
+            beta.abs() > self.patient_edge_threshold
+        ).to(torch.int64)
+        patient_adjacency = patient_adjacency * global_adjacency.unsqueeze(0)
+        return global_adjacency, patient_adjacency
+
+    def infer_graph(self, data: torch.Tensor) -> Dict[str, torch.Tensor]:
+        embedding = self.encode(data)
+        output = self.dynamic_dag(embedding=embedding)
+        global_adjacency, patient_adjacency = self._discrete_graphs(
+            output["beta"], output["support"]
+        )
+        output.update(
+            {
+                "embedding": embedding,
+                "global_adjacency": global_adjacency,
+                "patient_adjacency": patient_adjacency,
+            }
+        )
+        return output
+
+    def forward(
+        self,
+        data: torch.Tensor,
+        Y: Optional[torch.Tensor] = None,
+        observational_mask: Optional[torch.Tensor] = None,
+        lambda_group: float = 0.0,
+        gamma_acyclicity: float = 0.0,
+        return_discrete_graphs: bool = False,
+        **_: object,
+    ) -> Dict[str, torch.Tensor]:
+        embedding = self.encode(data)
+        output = self.dynamic_dag(
+            embedding=embedding,
+            Y=Y,
+            observational_mask=observational_mask,
+            lambda_group=lambda_group,
+            gamma_acyclicity=gamma_acyclicity,
+        )
+        output["embedding"] = embedding
+        if return_discrete_graphs:
+            global_adjacency, patient_adjacency = self._discrete_graphs(
+                output["beta"], output["support"]
+            )
+            output["global_adjacency"] = global_adjacency
+            output["patient_adjacency"] = patient_adjacency
+        return output
+
+
 if __name__ == "__main__":
+    features = torch.randn(2, 121, 1024)
+    expression = torch.randn(2, 8)
 
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
+    baseline = TransMILRegression(n_genes=8)
+    print("Regression:", baseline(features)["preds"].shape)
 
-    B = 2
-    N_tiles = 300
-
-    # ======================================================
-    # Virchow2 example
-    # ======================================================
-    D = 2560
-
-    data = torch.randn(
-        B,
-        N_tiles,
-        D,
-        device=device,
-    )
-
-    model = TransMILRegression(
-        n_genes=4,
-        feat_dim=D,
-    ).to(device)
-
-    model.eval()
-
-    with torch.no_grad():
-        out = model(
-            data=data
-        )
-
-    print(
-        "Virchow preds:",
-        out["preds"].shape,
-    )
-
-    print(
-        "Virchow embedding:",
-        out["embedding"].shape,
-    )
-
-    # ======================================================
-    # 1024-d extractor example
-    # ======================================================
-    D = 1024
-
-    data = torch.randn(
-        B,
-        N_tiles,
-        D,
-        device=device,
-    )
-
-    model = TransMILRegression(
-        n_genes=4,
-        feat_dim=D,
-    ).to(device)
-
-    model.eval()
-
-    with torch.no_grad():
-        out = model(
-            data=data
-        )
-
-    print(
-        "1024-d preds:",
-        out["preds"].shape,
-    )
+    dag_model = TransMILDAG(n_genes=8)
+    train_output = dag_model(features, Y=expression, lambda_group=1e-3)
+    print("DAG beta:", train_output["beta"].shape)
+    graph_output = dag_model.infer_graph(features)
+    print("Patient graphs:", graph_output["patient_adjacency"].shape)
